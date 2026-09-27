@@ -1,6 +1,7 @@
 [Unit]
 Description=libvirt-autoballoon
 After=local-fs.target
+ConditionPathExists=/etc/libvirt/autoballoon.json
 
 [Service]
 Type=simple
@@ -9,7 +10,6 @@ Nice=19
 SuccessExitStatus=143
 OOMScoreAdjust=-999
 Restart=always
-CPUAccounting=true
 MemoryHigh=16M
 MemoryMax=64M
 ProtectSystem=true
