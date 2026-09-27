@@ -1,11 +1,16 @@
-{"vms": [
+{
+    "default": {
+        "balloon": false,
+        "keep_free_kb": 524288
+    },
+    "vms": [
     {
         "name": "vm_name1",
-        "balloon": true,
-        "keep_free_kb": 1048576
+        "balloon": true
     },
     {
         "name": "vm_name2",
-        "balloon": true
+        "balloon": true,
+        "keep_free_kb": 1048576
     }
 ]}
