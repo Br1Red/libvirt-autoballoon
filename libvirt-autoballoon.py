@@ -104,10 +104,10 @@ class LibVirtAutoBalloon:
             return
         memstat = dom.memoryStats()
         actual = memstat.get("actual", 0)
-        usable = memstat.get("usable", 0)
+        usable = memstat.get("usable", -1)
 
-        if actual <=0 or usable <= 0:
-            print("{} has invalid memory stats, skipping".format(dom.name()), flush=True)
+        if actual <= 0 or usable < 0:
+            logging.debug("%s has invalid memory stats, skipping", dom.name())
             return
 
         keep_usable = self.dom_keep_usable(dom)
