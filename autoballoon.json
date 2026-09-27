@@ -1,16 +1,11 @@
 {
-    "default": {
-        "balloon": false,
-        "keep_free_kb": 524288
-    },
-    "vms": [
-    {
-        "name": "vm_name1",
-        "balloon": true
-    },
-    {
-        "name": "vm_name2",
-        "balloon": true,
-        "keep_free_kb": 1048576
-    }
-]}
+	"default": {
+		"balloon": false,
+		"keep_free_kb": 524288,
+		"threshold": 0.5
+	},
+	"vms": [
+		{"name": "guest-a", "balloon": true},
+		{"name": "guest-b", "balloon": true, "keep_free_kb": 1048576, "threshold": 0.25}
+	]
+}

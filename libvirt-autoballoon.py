@@ -3,12 +3,16 @@
 import sys
 import json
 import argparse
+import logging
+import math
+import xml.etree.ElementTree as ET
 import libvirt
 
 from time import sleep
 
 SZ_1MiB = 1024
-SZ_512MiB = 524288
+SZ_256MiB = 256 * 1024
+SZ_512MiB = 512 * 1024
 
 class ExitFailure(Exception):
     pass
@@ -21,7 +25,7 @@ class LibVirtAutoBalloon:
     def __init__(self, qemu_addr='qemu:///system', configfile='/etc/libvirt/autoballoon.json'):
         self.configfile = configfile
         self.monitored_vms = set()
-        print("Connecting to libvirt", flush=True)
+        print("Connecting to libvirt at {}".format(qemu_addr), flush=True)
         self.conn = libvirt.open(qemu_addr)
         if self.conn is None:
             raise ExitFailure('Failed to open connection to the hypervisor')
@@ -29,9 +33,35 @@ class LibVirtAutoBalloon:
         self.dom_print_names()
 
     def __load_config(self):
-        print("Load config file: {}".format(self.configfile))
+        print("Loading config file: {}".format(self.configfile), flush=True)
         content = open(self.configfile).read(-1)
         self.config = json.loads(content, parse_int=int)
+        self.__validate_config_parameters()
+
+    def __validate_config_parameters(self):
+        configurations = [("default", self.config.get("default", {}))]
+        configurations.extend(
+            ("VM {}".format(vm.get("name", "<unnamed>")), vm)
+            for vm in self.config["vms"]
+        )
+
+        for scope, parameters in configurations:
+            keep_free_kb = parameters.get("keep_free_kb")
+            if keep_free_kb is not None and (
+                    isinstance(keep_free_kb, bool)
+                    or not isinstance(keep_free_kb, int)
+                    or keep_free_kb < SZ_256MiB):
+                raise ExitFailure(
+                    "Invalid {} keep_free_kb: expected an integer of at least 256 MiB".format(scope))
+
+            threshold = parameters.get("threshold")
+            if threshold is not None and (
+                    isinstance(threshold, bool)
+                    or not isinstance(threshold, (int, float))
+                    or threshold <= 0
+                    or isinstance(threshold, float) and not math.isfinite(threshold)):
+                raise ExitFailure(
+                    "Invalid {} threshold: expected a finite number greater than 0".format(scope))
 
     def __vm_config(self, vm):
         vm_config = self.config.get("default", {}).copy()
@@ -63,7 +93,7 @@ class LibVirtAutoBalloon:
         domainIDs = self.conn.listDomainsID()
         if domainIDs is None:
             raise ExitFailure('No active domains')
-        print("Name", "Total", "Actual", "Used", "Usable", "Thrshld", "Units", "Ratio", sep='\t', flush=True)
+        print("Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Units", sep='\t', flush=True)
         for domainID in domainIDs:
             dom = self.conn.lookupByID(domainID)
             if dom.name() in self.monitored_vms:
@@ -72,32 +102,64 @@ class LibVirtAutoBalloon:
     def process_domainID(self, dom):
         if dom.name() not in self.monitored_vms:
             return
-        keep_usable = self.dom_keep_usable(dom)
         memstat = dom.memoryStats()
         actual = memstat.get("actual", 0)
         usable = memstat.get("usable", 0)
 
         if actual <=0 or usable <= 0:
-            print("Domain {} has invalid memory stats, skipping".format(dom.name()), file=sys.stderr, flush=True)
+            print("{} has invalid memory stats, skipping".format(dom.name()), flush=True)
             return
 
-        if usable < keep_usable or usable > keep_usable * 2:
-            delta = keep_usable * 1.5 - usable
+        keep_usable = self.dom_keep_usable(dom)
+        threshold = float(self.__vm_config_for_name(dom.name()).get("threshold", 0.5))
+        logging.debug("%s memory stats: actual=%s KiB, usable=%s KiB, lower_threshold=%s KiB, upper_threshold=%s KiB",
+                  dom.name(), actual, usable, keep_usable, keep_usable * (1 + 2 * threshold))
+
+        if usable < keep_usable or usable > keep_usable * (1 + 2 * threshold):
+            delta = keep_usable * (1 + threshold) - usable
             target = max(actual + int(delta), keep_usable * 2)
+            logging.debug("%s usable memory outside threshold; setting target to %s KiB",
+                          dom.name(), target)
             dom_balloon(dom, target)
 
     def dom_print_names(self):
-        domainNames = []
-        for i in self.conn.listAllDomains():
-            domainNames += [i.name()]
-        self.monitored_vms = {
-            name for name in domainNames
-            if self.__vm_config_for_name(name).get("balloon", False) is True
-        }
-        print("Found domains:", domainNames, flush=True)
-        for i in domainNames:
-            if i not in self.monitored_vms:
-                print("{} not selected for monitoring, ignored".format(i), flush=True)
+        domains = self.conn.listAllDomains()
+        domainNames = [dom.name() for dom in domains]
+        self.monitored_vms = set()
+        logging.debug("Found domains: %s", domainNames)
+        for dom in domains:
+            name = dom.name()
+            if self.__vm_config_for_name(name).get("balloon", False) is not True:
+                print("Not monitoring {}: not selected for monitoring".format(name), flush=True)
+                continue
+
+            try:
+                domain_xml = ET.fromstring(dom.XMLDesc(0))
+            except (libvirt.libvirtError, ET.ParseError) as error:
+                print("Not monitoring {}: Cannot inspect balloon definition: {}".format(name, error), flush=True)
+                continue
+
+            balloon = domain_xml.find("./devices/memballoon")
+            stats = balloon.find("stats") if balloon is not None else None
+            raw_period = stats.get("period") if stats is not None else None
+            if raw_period is None:
+                print("Not monitoring {}: balloon stats period is missing".format(name), flush=True)
+                continue
+
+            try:
+                stats_period = int(raw_period)
+            except ValueError:
+                stats_period = None
+
+            if stats_period is None or not 0 < stats_period <= 5:
+                print("Not monitoring {}: invalid balloon stats period {!r}, expected 1 to 5".format(
+                    name, raw_period))
+                continue
+
+            self.monitored_vms.add(name)
+            print("Monitoring {}".format(name), flush=True)
+            if balloon is None or balloon.get("autodeflate") != "on":
+                print("{}: autodeflate='on' is recommended, but is not set".format(name), flush=True)
 
     def dom_keep_usable(self, dom):
         name = dom.name()
@@ -109,7 +171,7 @@ class LibVirtAutoBalloon:
 
     def daemon(self):
         self.sleep_time = 5
-        print("Start daemon", flush=True)
+        print("Starting daemon", flush=True)
 
         while True:
             domainIDs = self.conn.listDomainsID()
@@ -127,7 +189,7 @@ class LibVirtAutoBalloon:
                         dom = self.conn.lookupByID(domainID)
                         self.process_domainID(dom)
                     except libvirt.libvirtError as error:
-                        print("Domain {} stopped or unavailable, skipping: {}".format(domainID, error),
+                        print("{} stopped or unavailable, skipping: {}".format(domainID, error),
                               file=sys.stderr, flush=True)
 
             sleep(self.sleep_time)
@@ -160,8 +222,13 @@ def libvirt_autoballoon(argv):
     parser = argparse.ArgumentParser(prog="libvirt-autoballoon")
     parser.add_argument("-c", "--config", default="/etc/libvirt/autoballoon.json",
                         help="path to the configuration file (default: %(default)s)")
+    parser.add_argument("-d", "--debug", action="store_true",
+                        help="enable debug output")
     parser.add_argument("action", choices=("start", "status"), help="start daemon or show status")
     args = parser.parse_args(argv[1:])
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.WARNING,
+        format="%(levelname)s %(message)s")
 
     lv_ctrl = LibVirtAutoBalloon(configfile=args.config)
 
