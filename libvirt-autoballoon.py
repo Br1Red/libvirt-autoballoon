@@ -8,7 +8,7 @@ import math
 import xml.etree.ElementTree as ET
 import libvirt
 
-from time import sleep
+from time import sleep, monotonic
 
 SZ_1MiB = 1024
 SZ_256MiB = 256 * 1024
@@ -25,6 +25,8 @@ class LibVirtAutoBalloon:
     def __init__(self, qemu_addr='qemu:///system', configfile='/etc/libvirt/autoballoon.json'):
         self.configfile = configfile
         self.monitored_vms = set()
+        self.memory_targets = {}
+        self.manual_increase_until = {}
         print("Connecting to libvirt at {}".format(qemu_addr), flush=True)
         self.conn = libvirt.open(qemu_addr)
         if self.conn is None:
@@ -63,6 +65,14 @@ class LibVirtAutoBalloon:
                 raise ExitFailure(
                     "Invalid {} threshold: expected a finite number greater than 0".format(scope))
 
+            grace = parameters.get("manual_increase_grace_seconds")
+            if grace is not None and (
+                    isinstance(grace, bool)
+                    or not isinstance(grace, int)
+                    or grace < 0):
+                raise ExitFailure(
+                    "Invalid {} manual_increase_grace_seconds: expected a non-negative integer".format(scope))
+
     def __vm_config(self, vm):
         vm_config = self.config.get("default", {}).copy()
         vm_config.update(vm)
@@ -100,8 +110,17 @@ class LibVirtAutoBalloon:
                 self.dom_status(dom)
 
     def process_domainID(self, dom):
-        if dom.name() not in self.monitored_vms:
+        name = dom.name()
+        if name not in self.monitored_vms:
             return
+        grace = self.__vm_config_for_name(name).get("manual_increase_grace_seconds", 0)
+        if grace:
+            current_target = dom.info()[2]
+            previous_target = self.memory_targets.get(name)
+            if previous_target is not None and current_target > previous_target:
+                self.manual_increase_until[name] = monotonic() + grace
+                print("{} memory increased externally; postponing reductions for {} seconds".format(name, grace), flush=True)
+            self.memory_targets[name] = current_target
         memstat = dom.memoryStats()
         actual = memstat.get("actual", 0)
         usable = memstat.get("usable", -1)
@@ -118,9 +137,14 @@ class LibVirtAutoBalloon:
         if usable < keep_usable or usable > keep_usable * (1 + 2 * threshold):
             delta = keep_usable * (1 + threshold) - usable
             target = max(actual + int(delta), keep_usable * 2)
+            if target < actual and monotonic() < self.manual_increase_until.get(name, 0):
+                logging.debug("%s reduction postponed after external memory increase", name)
+                return
             logging.debug("%s usable memory outside threshold; setting target to %s KiB",
                           dom.name(), target)
             dom_balloon(dom, target)
+            if grace:
+                self.memory_targets[name] = max(self.memory_targets[name], min(target, dom.info()[1]))
 
     def dom_print_names(self):
         domains = self.conn.listAllDomains()

@@ -46,7 +46,7 @@ values. If `balloon` is omitted from both places, it defaults to `false`.
 		"threshold": 0.5
 	},
 	"vms": [
-		{"name": "guest-a", "balloon": true},
+		{"name": "guest-a", "balloon": true, "manual_increase_grace_seconds": 3600},
 		{"name": "guest-b", "balloon": true, "keep_free_kb": 1048576, "threshold": 0.25}
 	]
 }
@@ -63,6 +63,14 @@ falls below $K$ or rises above $K(1 + 2T)$. It then targets usable memory of
 $K(1 + T)$. For example, with the default `threshold` of `0.5`, the action
 range is below $K$ or above $2K$, and the target is $1.5K$. A per-VM value
 overrides the default.
+
+`manual_increase_grace_seconds` postpones reductions after the daemon detects
+that a VM's current memory increased without a request from the daemon. Set it
+per VM (or in `default`) to the desired number of seconds; `3600` gives one
+hour. During that time the daemon can still increase memory if the VM needs it.
+It defaults to `0` (no delay) and must be a non-negative integer. The daemon
+starts tracking at launch, so increases made before it starts are not detected.
+Restart the service after changing the configuration.
 
 The RAM target is at least $2K$, but is capped at the VM's maximum memory. If
 that maximum is below $2K$, the daemon uses the maximum available value and
