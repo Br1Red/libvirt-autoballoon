@@ -137,6 +137,9 @@ class LibVirtAutoBalloon:
         if usable < keep_usable or usable > keep_usable * (1 + 2 * threshold):
             delta = keep_usable * (1 + threshold) - usable
             target = max(actual + int(delta), keep_usable * 2)
+            if target < actual and self.host_has_spare_memory():
+                logging.debug("%s reduction skipped: host available memory exceeds 50%%", name)
+                return
             if target < actual and monotonic() < self.manual_increase_until.get(name, 0):
                 logging.debug("%s reduction postponed after external memory increase", name)
                 return
@@ -145,6 +148,19 @@ class LibVirtAutoBalloon:
             dom_balloon(dom, target)
             if grace:
                 self.memory_targets[name] = max(self.memory_targets[name], min(target, dom.info()[1]))
+
+    def host_has_spare_memory(self):
+        stats = {}
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo.read().splitlines():
+                fields = line.split()
+                if fields and fields[0] in ("MemTotal:", "MemAvailable:"):
+                    stats[fields[0].rstrip(":")] = int(fields[1])
+        total = stats.get("MemTotal", 0)
+        available = stats.get("MemAvailable", -1)
+        if total <= 0 or not 0 <= available <= total:
+            raise ExitFailure("Invalid or missing MemTotal/MemAvailable in /proc/meminfo")
+        return available * 2 > total
 
     def dom_print_names(self):
         domains = self.conn.listAllDomains()

@@ -41,13 +41,14 @@ values. If `balloon` is omitted from both places, it defaults to `false`.
 ```json
 {
 	"default": {
-		"balloon": false,
+		"balloon": true,
 		"keep_free_kb": 524288,
-		"threshold": 0.5
+		"threshold": 0.5,
+		"manual_increase_grace_seconds": 600
 	},
 	"vms": [
-		{"name": "guest-a", "balloon": true, "manual_increase_grace_seconds": 3600},
-		{"name": "guest-b", "balloon": true, "keep_free_kb": 1048576, "threshold": 0.25}
+		{"name": "guest-a", "balloon": false},
+		{"name": "guest-b", "keep_free_kb": 1048576, "threshold": 0.25}
 	]
 }
 ```
@@ -63,6 +64,14 @@ falls below $K$ or rises above $K(1 + 2T)$. It then targets usable memory of
 $K(1 + T)$. For example, with the default `threshold` of `0.5`, the action
 range is below $K$ or above $2K$, and the target is $1.5K$. A per-VM value
 overrides the default.
+
+When the host's available memory is strictly greater than 50% of its total RAM,
+the daemon does not reduce VM memory. It still increases memory when required
+by the guest's usable-memory thresholds. At 50% or below, the normal reduction
+rules apply, including any manual-increase grace period. Host memory is read
+from `MemAvailable` and `MemTotal` in the local Linux `/proc/meminfo` (the daemon
+must run on the hypervisor). Missing or invalid host memory statistics stop
+processing with an error rather than allowing a reduction.
 
 `manual_increase_grace_seconds` postpones reductions after the daemon detects
 that a VM's current memory increased without a request from the daemon. Set it

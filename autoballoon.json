@@ -1,11 +1,12 @@
 {
 	"default": {
-		"balloon": false,
+		"balloon": true,
 		"keep_free_kb": 524288,
-		"threshold": 0.5
+		"threshold": 0.5,
+		"manual_increase_grace_seconds": 600
 	},
 	"vms": [
-		{"name": "guest-a", "balloon": true},
-		{"name": "guest-b", "balloon": true, "keep_free_kb": 1048576, "threshold": 0.25}
+		{"name": "guest-a", "balloon": false},
+		{"name": "guest-b", "keep_free_kb": 1048576, "threshold": 0.25}
 	]
 }
