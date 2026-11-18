@@ -1,7 +1,8 @@
 # libvirt-autoballoon
 
 Daemon that reclaims unused memory from libvirt QEMU guests by adjusting their
-balloon devices.
+balloon devices. An adaptive EWMA/PD controller balances guest reserves against
+host memory pressure, with slow reclaim and rapid guest memory growth.
 
 ## VM Requirements
 
@@ -22,9 +23,9 @@ VM is not monitored. `autodeflate='on'` is recommended, but optional; its
 absence produces a warning only.
 
 The daemon uses `libvirt-python` with one persistent connection to
-`qemu:///system`; it does not invoke `virsh`. Memory is checked every 2 seconds
-using libvirt's event loop. Guest statistics still update at the XML stats
-period; a 1- or 2-second period provides fresher data for this interval.
+`qemu:///system`. Memory is checked every 2 seconds using libvirt's event loop.
+Guest statistics still update at the XML stats period; a 1- or 2-second period
+provides fresher data for this interval.
 
 After an initial inventory, libvirt lifecycle events discover newly defined
 or started VMs and recheck their monitoring requirements without restarting
@@ -50,15 +51,23 @@ values. If `balloon` is omitted from both places, it defaults to `false`.
 
 ```json
 {
+	"general": {
+		"psi_threshold": 5.0,
+		"host_min_free_ratio": 0.2
+	},
 	"default": {
 		"balloon": true,
 		"keep_free_kb": 524288,
-		"threshold": 0.5,
+		"keep_free_ratio": 0.1,
+		"ewma_alpha": 0.3,
+		"reclaim_ratio": 0.03,
+		"pd_kp": 0.5,
+		"pd_kd": 1.0,
 		"manual_increase_grace_seconds": 600
 	},
 	"vms": [
 		{"name": "guest-a", "balloon": false},
-		{"name": "guest-b", "keep_free_kb": 1048576, "threshold": 0.25}
+		{"name": "guest-b", "keep_free_kb": 1048576}
 	]
 }
 ```
@@ -68,20 +77,26 @@ of KiB. It must be at least `262144` KiB (256 MiB); smaller values are invalid.
 It defaults to 512 MiB (`524288` KiB), regardless of the
 VM's total memory. A per-VM value overrides the default.
 
-`threshold` is a finite number greater than zero and defaults to `0.5`. For a
-`keep_free_kb` value of $K$ and threshold $T$, the daemon acts when usable memory
-falls below $K$ or rises above $K(1 + 2T)$. It then targets usable memory of
-$K(1 + T)$. For example, with the default `threshold` of `0.5`, the action
-range is below $K$ or above $2K$, and the target is $1.5K$. A per-VM value
-overrides the default.
+The following finite numeric settings can also be overridden per VM:
 
-When the host's available memory is strictly greater than 50% of its total RAM,
-the daemon does not reduce VM memory. It still increases memory when required
-by the guest's usable-memory thresholds. At 50% or below, the normal reduction
-rules apply, including any manual-increase grace period. Host memory is read
-from `MemAvailable` and `MemTotal` in the local Linux `/proc/meminfo` (the daemon
-must run on the hypervisor). Missing or invalid host memory statistics stop
-processing with an error rather than allowing a reduction.
+| Setting | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `keep_free_ratio` | `0.1` | 0 to 1 | Proportional usable-memory reserve |
+| `ewma_alpha` | `0.3` | Greater than 0, at most 1 | Weight of the newest working-set sample |
+| `reclaim_ratio` | `0.03` | Greater than 0, at most 0.05 | Maximum fraction of current RAM reclaimed per fresh sample |
+| `pd_kp` | `0.5` | Greater than 0, at most 1 | Proportional gain |
+| `pd_kd` | `1.0` | 0 to 10 seconds | Derivative gain; 0 disables derivative braking |
+
+These finite numeric settings apply to the whole host and are accepted only in
+the optional `general` section:
+
+| Setting | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `psi_threshold` | `5.0` | Greater than 0, at most 100 | PSI `some avg10` percentage at which reclaim reaches full pressure |
+| `host_min_free_ratio` | `0.2` | Greater than 0, at most 1 | Host available-memory safety buffer as a fraction of total RAM |
+
+When `general` or an option is
+omitted, the documented built-in defaults apply.
 
 `manual_increase_grace_seconds` postpones reductions after the daemon detects
 that a VM's current memory increased without a request from the daemon. Set it
@@ -89,12 +104,113 @@ per VM (or in `default`) to the desired number of seconds; `3600` gives one
 hour. During that time the daemon can still increase memory if the VM needs it.
 It defaults to `0` (no delay) and must be a non-negative integer. The daemon
 starts tracking at launch, so increases made before it starts are not detected.
+Detection uses fresh balloon memory samples, allowing for virtio's 4 KiB page
+rounding and the daemon's outstanding requests. It is not proof of an operator
+action: an increase not attributable to the daemon, including guest autodeflate,
+can also start the grace period. Logs call these increases "unattributed".
 Configuration changes take effect when the next VM starts, or after restarting
 the service.
 
-The RAM target is at least $2K$, but is capped at the VM's maximum memory. If
-that maximum is below $2K$, the daemon uses the maximum available value and
-cannot maintain the configured reserve.
+## Adaptive controller
+
+For each fresh guest sample, `Used = actual - usable`. The controller smooths
+this working-set estimate with:
+
+```
+UsedEWMA = alpha * Used + (1 - alpha) * PreviousUsedEWMA
+Reserve = max(keep_free_kb, actual * keep_free_ratio)
+Error = Reserve - (actual - UsedEWMA)
+Elapsed = max(1, updated - previous_updated)
+Derivative = (Error - PreviousError) / Elapsed
+DerivativeTerm = max(-abs(Error), min(abs(Error), pd_kd * Derivative))
+DeltaRAM = pd_kp * Error + DerivativeTerm
+```
+
+The first sample initializes the EWMA directly and has no derivative term.
+Elapsed time comes from successive guest-statistics `last_update` timestamps,
+not the polling interval, and is bounded below by one second. The derivative
+contribution cannot exceed the current absolute error in either direction.
+Duplicate samples are not processed again; missing
+or invalid statistics are skipped, and statistics older than 15 seconds or
+dated in the future produce a warning and are skipped. A backwards timestamp
+resets the filter. Lifecycle transitions and configuration changes reset
+controller history, without discarding existing manual-increase grace periods.
+The status command's `Keep_Usable` column shows the effective reserve.
+
+### Slow reclaim, rapid growth
+
+Reclaim is allowed only when both the instantaneous and smoothed usable
+memory exceed the reserve. It never consumes that instantaneous reserve.
+The derivative term can brake reclaim but cannot turn it into growth while
+the smoothed reserve is satisfied, unless an emergency growth signal is present.
+
+If instantaneous usable memory is below the reserve, or used memory grows
+faster than 5% of current RAM per second, growth bypasses EWMA smoothing.
+The controller requests at least 25% of current RAM, or enough to cover the
+reserve deficit and another polling interval of positive consumption trend,
+whichever is larger. Ordinary positive PD corrections are capped at 50% of
+current RAM per sample. All requests are capped at the VM's maximum memory.
+Progress toward an outstanding growth request does not trigger manual-increase
+grace periods. Ordinary adjustments wait until the previous balloon request
+completes, rather than reversing or replacing a request still in flight.
+Emergency growth can supersede an outstanding request with a higher target.
+Uncompleted requests expire after 30 seconds, with a warning, so an unresponsive
+guest does not block future adjustments indefinitely. The daemon may retry on
+the next usable sample, subject to the normal pressure and grace-period rules.
+Expiration is checked even when guest statistics are stale.
+
+The minimum RAM target accounts for both the absolute reserve and the configured
+ratio, capped at the VM's maximum:
+
+```
+Floor = min(maximum_ram, int(2 * keep_free_kb / max(0.1, 1 - keep_free_ratio)))
+```
+
+The denominator is bounded below by 0.1, including for ratios near or equal to
+1. A VM below this floor can be grown to it even when its instantaneous reserve
+is sufficient. The proportional reserve still uses current RAM, not the VM's
+historical or maximum RAM. A VM whose maximum is too small cannot maintain the
+configured reserve.
+Targets are capped at the VM's maximum and rounded down to a multiple of 4 KiB.
+Adjustments smaller than 1 MiB are then skipped based on the absolute difference
+in KiB. Logs display MiB with three decimal places; the same page-aligned KiB
+target is sent to libvirt and recorded in pending requests.
+These limits reduce risk; they do not guarantee that a guest will avoid OOM.
+
+### Host pressure and reclaim priority
+
+Once per control cycle, the daemon reads `some avg10` from
+`/proc/pressure/memory` and `MemAvailable`/`MemTotal` from `/proc/meminfo`.
+It must run on the hypervisor. The pressure factor is:
+
+```
+Pressure = max(min(avg10 / psi_threshold, 1),
+               max(0, 1 - MemAvailable / (MemTotal * host_min_free_ratio)))
+```
+
+With the default settings, zero PSI and at least 20% host RAM available prevent
+all reclaim.
+Reclaim increases continuously as available RAM falls below that safety buffer,
+or PSI rises toward 5%. Both thresholds are configurable in `general`.
+An `avg10` value of `5` means 5%, not a fraction.
+
+VMs are processed in descending idle ratio (`usable / actual`). Each reclaim
+is bounded by the negative PD correction, the safely reclaimable surplus, and:
+
+```
+actual * reclaim_ratio * Pressure * idle_ratio
+```
+
+Thus idle guests yield first and more aggressively, while busy guests retain
+their reserve. If PSI or host memory data is unavailable or invalid, an error
+is logged and reclaim is disabled for that cycle. Guest growth remains enabled;
+the daemon retries host statistics on the next cycle.
+
+## Shutdown
+
+SIGTERM (including `systemctl stop`) removes the polling timer, deregisters
+lifecycle callbacks, and closes the libvirt connection before exiting with
+status 143, which the supplied systemd unit treats as a successful shutdown.
 
 # Installation
 

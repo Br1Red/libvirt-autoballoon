@@ -1,12 +1,20 @@
 {
+	"general": {
+		"psi_threshold": 5.0,
+		"host_min_free_ratio": 0.2
+	},
 	"default": {
 		"balloon": true,
 		"keep_free_kb": 524288,
-		"threshold": 0.5,
+		"keep_free_ratio": 0.1,
+		"ewma_alpha": 0.3,
+		"reclaim_ratio": 0.03,
+		"pd_kp": 0.5,
+		"pd_kd": 1.0,
 		"manual_increase_grace_seconds": 600
 	},
 	"vms": [
 		{"name": "guest-a", "balloon": false},
-		{"name": "guest-b", "keep_free_kb": 1048576, "threshold": 0.25}
+		{"name": "guest-b", "keep_free_kb": 1048576}
 	]
 }
