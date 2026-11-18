@@ -119,6 +119,180 @@ can also start the grace period. Logs call these increases "unattributed".
 Configuration changes take effect when the next VM starts, or after restarting
 the service.
 
+## Configuration tuning
+
+Start with the example configuration, measure a representative workload
+including peak demand, and change one parameter at a time. Put host-wide
+settings in `general`, shared VM settings in `default`, and workload-specific
+overrides in `vms`. The suggestions below are starting points, not guarantees
+against host or guest OOM.
+
+### 1. Choose reserves and priorities first
+
+- **`keep_free_kb`** provides an absolute reserve for small VMs and sudden bursts.
+  Start with 512 MiB (`524288` KiB). The minimum of 256 MiB (`262144` KiB)
+  can suit measured, lightweight Linux micro-VMs or routers; consider 1 GiB
+  (`1048576` KiB) or more for Windows guests, heavy application servers, or
+  large allocation bursts. Do not lower it just to maximize reclaimed RAM.
+- **`keep_free_ratio`** adds a reserve proportional to current allocation.
+  Start at `0.1`; consider `0.15` to `0.20` for latency-sensitive, bursty,
+  or I/O-heavy workloads such as databases and file servers. Extra headroom
+  can help reduce cache churn, but is not a dedicated page-cache reservation.
+  The effective reserve is the larger of the absolute and proportional values,
+  not their sum. Increasing either setting also raises the minimum RAM floor.
+  Check that the VM's maximum RAM leaves enough room for both its working set
+  and reserve.
+- **`memory_weight`** expresses reclaim priority, not a memory entitlement.
+  Use `100` for standard web, proxy, or DNS services, `300` to `800` for
+  critical production guests and databases, and `30` to `50` for development,
+  CI, or batch workloads. Weight `500` gives one fifth of
+  the normal reclaim rate; weights below `50` do not increase the rate beyond
+  the twofold cap, although they still affect processing order. Emergency
+  growth remains independent of weight.
+- **`balloon`** can be set to `false` for workloads that should not be managed
+  by this daemon. Their memory must still fit within the host's capacity.
+
+This illustrative configuration combines a balanced shared profile with a
+protected database and a more reclaimable CI runner. These are tuning examples,
+not new built-in defaults; choose the host buffer and guest reserves from
+measurements before deploying:
+
+```json
+{
+	"general": {
+		"psi_threshold": 5.0,
+		"host_min_free_ratio": 0.12
+	},
+	"default": {
+		"balloon": true,
+		"keep_free_kb": 524288,
+		"keep_free_ratio": 0.1,
+		"memory_weight": 100,
+		"ewma_alpha": 0.25,
+		"reclaim_ratio": 0.015,
+		"pd_kp": 0.4,
+		"pd_kd": 1.2,
+		"manual_increase_grace_seconds": 1800
+	},
+	"vms": [
+		{
+			"name": "db-prod-01",
+			"memory_weight": 500,
+			"keep_free_kb": 2097152,
+			"keep_free_ratio": 0.15,
+			"reclaim_ratio": 0.005,
+			"manual_increase_grace_seconds": 3600
+		},
+		{
+			"name": "ci-runner-01",
+			"memory_weight": 40,
+			"keep_free_kb": 262144,
+			"keep_free_ratio": 0.05,
+			"reclaim_ratio": 0.025,
+			"manual_increase_grace_seconds": 300
+		}
+	]
+}
+```
+
+### 2. Size the host safety buffer
+
+- **`host_min_free_ratio`** determines when low host available memory starts
+  contributing to reclaim. A larger value starts reclaim earlier and retains
+  more host headroom; a smaller value allows more RAM to remain with guests.
+  On smaller hosts with 16 to 32 GiB, keep the default `0.20` as an initial
+  cushion for QEMU and the host kernel. On hosts with 256 to 512 GiB, that
+  default corresponds to 51.2 to 102.4 GiB; consider `0.08` to `0.10` if
+  measurements show the larger buffer is unnecessary. Allow for host services,
+  allocation bursts, and reclaim latency before reducing it. This is a pressure
+  input, not a hard reservation or a guarantee that this RAM stays unused.
+- **`psi_threshold`** is the PSI `some avg10` percentage at which the PSI
+  contribution reaches full pressure. Lowering it from `5` makes reclaim more
+  aggressive for the same stalls; raising it tolerates more contention.
+  It is not an on/off threshold: nonzero PSI already contributes below it.
+  Either PSI or low available memory can trigger reclaim independently.
+  For latency-sensitive host services or slow storage, consider `2.0` to
+  `3.0` to reach stronger reclaim at lower stall percentages. Values of
+  `8.0` to `10.0` may suit throughput-oriented, high-density deployments with
+  fast NVMe storage only if measured latency remains acceptable. Fast storage
+  alone does not make sustained memory stalls safe.
+
+If host stalls persist, first check whether guests have reclaimable surplus,
+are blocked by grace periods, or are already at their floors. Increasing
+aggressiveness cannot recover memory that guests genuinely need.
+
+### 3. Balance reclaim speed and responsiveness
+
+- **Stats period (VM XML)**: use 1 to 2 seconds for rapidly changing workloads,
+  or up to 5 seconds for steadier ones. Polling automatically follows the
+  smallest monitored period, but each guest still supplies fresh samples at
+  its own period. Faster polling cannot compensate for a slow guest stats
+  period. For example, use `<stats period='1'/>` for `db-prod-01` and
+  `<stats period='5'/>` for a steady secondary guest. This reduces the
+  secondary guest's stats refresh frequency, not the daemon's query frequency:
+  with a 1-second minimum it still polls all monitored guests every second.
+- **`reclaim_ratio`** is a per-second base rate. Start at `0.015`; reduce it
+  to `0.005` if reclaim causes guest I/O spikes or latency. Increase gradually
+  only if the host remains pressured while guests have sustained surplus.
+  For example, `0.015` over 2 seconds gives a 3% base limit, then pressure,
+  idle ratio, and weight scale it further. At full pressure, idle ratio `0.6`,
+  and weight `100`, the default gives a limit of 0.9% per second, not a fixed
+  0.9% for every VM. Consider `0.025` to `0.03` for stateless or batch guests
+  only after measuring the effect; low weights can double that limit.
+  Longer sample intervals permit
+  larger individual steps even at the same per-second rate; shorter stats
+  periods help make those steps smaller. The PD correction and available
+  surplus may impose a lower limit.
+- **`ewma_alpha`** controls smoothing per fresh sample. Keep `0.3` initially.
+  Values around `0.15` to `0.20` smooth sawtooth or noisy workloads more, but adapt more
+  slowly; values around `0.4` to `0.5` track changes faster. The same alpha
+  smooths over more wall-clock time with a longer stats period. Low usable
+  memory and rapid consumption can still trigger emergency growth.
+- **`pd_kp` / `pd_kd`** should be tuned last. Start with `0.5` and `1.0`.
+  If targets repeatedly reverse direction, try a lower `pd_kp`, such as
+  `0.3`, after checking reserves and sample freshness. With a clear, low-noise
+  trend, test `pd_kd` of `1.5` to `2.0` separately and keep it only if the
+  measurements improve. The derivative term
+  responds to the direction of change, not just its size; increasing `pd_kd`
+  is not a universal cure for oscillation and can amplify noisy trends.
+  Compare with a smaller value or `0` to diagnose its effect.
+
+### 4. Set an appropriate manual-increase grace period
+
+**`manual_increase_grace_seconds`** is useful when an operator adds RAM for a
+temporary task, for example through a manual `virsh setmem`, and does not
+want it reclaimed immediately. The initial configuration example's `600`
+means 10 minutes. Consider `3600` (one hour) in `default` where manual
+interventions are common and headroom allows it, with an override of `300`
+(five minutes) for test VMs. The profile example above uses `1800` (30 minutes)
+as its shared value. The built-in default is still `0`, which disables the delay.
+Growth remains enabled during grace, but reclaim is postponed even when the
+host is under pressure. Guest autodeflate can also trigger this grace period:
+an "unattributed" increase is not necessarily a manual change. Avoid long
+periods on heavily overcommitted hosts unless sufficient host headroom exists.
+
+### 5. Verify the result under load
+
+Use `libvirt-autoballoon status` to inspect `Actual`, `Usable`, `Keep_Usable`,
+and `Weight`. Observe host `MemAvailable` and `/proc/pressure/memory` alongside
+guest swap activity, disk I/O, and application latency. Enable `--debug` on
+the existing daemon invocation when investigating controller decisions; do not
+run a second daemon against the same guests.
+
+Compare `Usable` with `Keep_Usable`, rather than relying on the ratio of
+`Actual` to `Keep_Usable`: allocated RAM alone does not show guest headroom.
+If `Usable` repeatedly falls below `Keep_Usable` during peaks and frequent
+`Grow dom:` messages follow reclaim, consider increasing that VM's
+`keep_free_ratio` or reducing its `reclaim_ratio`.
+
+Look for sustained host headroom, acceptable application latency, and targets
+that settle rather than repeatedly shrink and grow. If guest swap or latency
+rises during reclaim, reduce its rate or increase that VM's reserve or weight.
+Resolve stale statistics, unavailable PSI, and balloon-request timeout warnings
+before trying to compensate with controller gains. Apply configuration changes
+by restarting the service or at the next VM start, then repeat the same workload
+and compare measurements over several minutes, including bursts.
+
 ## Adaptive controller
 
 For each fresh guest sample, `Used = actual - usable`. The controller smooths
