@@ -5,16 +5,17 @@
 	},
 	"default": {
 		"balloon": true,
+		"memory_weight": 100,
 		"keep_free_kb": 524288,
 		"keep_free_ratio": 0.1,
 		"ewma_alpha": 0.3,
-		"reclaim_ratio": 0.03,
+		"reclaim_ratio": 0.015,
 		"pd_kp": 0.5,
 		"pd_kd": 1.0,
 		"manual_increase_grace_seconds": 600
 	},
 	"vms": [
 		{"name": "guest-a", "balloon": false},
-		{"name": "guest-b", "keep_free_kb": 1048576}
+		{"name": "guest-b", "keep_free_kb": 1048576, "memory_weight": 500}
 	]
 }

@@ -86,6 +86,8 @@ class AdaptiveControllerTests(unittest.TestCase):
             {"name": "guest-a", "balloon": True, "manual_increase_grace_seconds": 3600}
         ]}
         self.controller.monitored_vms = {"guest-a"}
+        self.controller.stats_periods = {"guest-a": 2}
+        self.controller.poll_interval = 2
         self.controller.memory_targets = {}
         self.controller.pending_targets = {}
         self.controller.manual_increase_until = {}
@@ -101,6 +103,27 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.now += seconds
         self.domain.updated = self.now
         self.controller.process_domainID(self.domain, pressure)
+
+    def test_status_shows_effective_memory_weight(self):
+        for default_weight, vm_weight, expected in (
+                (None, None, 100), (500, None, 500), (500, 200, 200)):
+            with self.subTest(default_weight=default_weight, vm_weight=vm_weight):
+                self.controller.config["default"] = (
+                    {} if default_weight is None else {"memory_weight": default_weight})
+                vm = self.controller.config["vms"][0]
+                if vm_weight is None:
+                    vm.pop("memory_weight", None)
+                else:
+                    vm["memory_weight"] = vm_weight
+                self.controller.conn = Mock()
+                self.controller.conn.listDomainsID.return_value = [1]
+                self.controller.conn.lookupByID.return_value = self.domain
+                with patch.object(self.controller, "dom_print_names"), patch("builtins.print") as output:
+                    self.controller.status()
+                self.assertEqual([call.args for call in output.call_args_list], [
+                    ("Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Weight", "Units"),
+                    ("guest-a", 8192, 1024, 512, 512, 512, expected, "MiB"),
+                ])
 
     def test_no_change_at_reserve(self):
         self.domain.memory = 1310720
@@ -124,6 +147,101 @@ class AdaptiveControllerTests(unittest.TestCase):
                 reductions.append(reduction)
         self.assertEqual(reductions[0], 0)
         self.assertLess(reductions[1], reductions[2])
+
+    def test_memory_weight_scales_reclaim_with_a_twofold_cap(self):
+        self.controller.config["default"]["memory_weight"] = 500
+        for weight, expected in (
+                (None, 18876), (1, 188744), (10, 188744), (50, 188744),
+                (100, 94372), (500, 18876), (1000, 9440)):
+            with self.subTest(weight=weight):
+                self.domain = Domain()
+                self.domain.memory = 4194304
+                self.domain.usable = 3145728
+                self.controller.memory_targets.clear()
+                self.controller.pending_targets.clear()
+                self.controller.control_samples.clear()
+                vm = self.controller.config["vms"][0]
+                if weight is None:
+                    vm.pop("memory_weight", None)
+                else:
+                    vm["memory_weight"] = weight
+                self.step()
+                self.assertEqual(4194304 - self.domain.memory, expected)
+
+    def test_initial_reclaim_uses_vm_stats_period_and_per_second_rate(self):
+        self.controller.poll_interval = 1
+        for rate, expected_reductions in (
+                (None, (47188, 94372, 235932)), (0.02, (62916, 125832, 314572))):
+            for period, expected in zip((1, 2, 5), expected_reductions):
+                with self.subTest(rate=rate, period=period):
+                    self.domain = Domain()
+                    self.domain.memory, self.domain.usable = 4194304, 3145728
+                    self.controller.control_samples.clear()
+                    self.controller.memory_targets.clear()
+                    self.controller.pending_targets.clear()
+                    self.controller.stats_periods["guest-a"] = period
+                    self.controller.config["default"] = (
+                        {} if rate is None else {"reclaim_ratio": rate})
+                    self.step(seconds=1)
+                    self.assertEqual(4194304 - self.domain.memory, expected)
+
+    def test_reclaim_uses_fresh_sample_elapsed_not_poll_interval(self):
+        self.controller.poll_interval = 1
+        self.controller.stats_periods["guest-a"] = 2
+        for elapsed, expected in ((1, 47188), (2, 94372), (5, 235932)):
+            with self.subTest(elapsed=elapsed):
+                self.domain = Domain()
+                self.domain.memory, self.domain.usable = 4194304, 3145728
+                self.controller.control_samples.clear()
+                self.controller.memory_targets.clear()
+                self.controller.pending_targets.clear()
+                self.step(pressure=0)
+                self.step(seconds=elapsed)
+                self.assertEqual(4194304 - self.domain.memory, expected)
+
+    def test_emergency_growth_anticipates_next_dynamic_poll(self):
+        self.controller.poll_interval = 5
+        self.controller.stats_periods["guest-a"] = 5
+        self.domain.memory, self.domain.usable = 4194304, 2097152
+        self.step(pressure=0)
+        self.domain.usable = 1310720
+        self.step(pressure=0)
+        self.assertEqual(self.domain.memory, 5373952)
+
+    def test_memory_weight_does_not_change_emergency_growth(self):
+        for usable in (102400, 1572864):
+            targets = []
+            for weight in (1, 100, 1000):
+                with self.subTest(usable=usable, weight=weight):
+                    self.domain = Domain()
+                    self.domain.memory = 4194304
+                    self.domain.usable = 2097152
+                    self.controller.memory_targets.clear()
+                    self.controller.pending_targets.clear()
+                    self.controller.control_samples.clear()
+                    self.controller.config["vms"][0]["memory_weight"] = weight
+                    self.step(pressure=0)
+                    self.domain.usable = usable
+                    self.step(pressure=0)
+                    self.assertGreaterEqual(self.domain.memory, 5242880)
+                    targets.append(self.domain.memory)
+            self.assertEqual(targets, [targets[0]] * 3)
+
+    def test_memory_weight_does_not_lower_floor_or_reserve(self):
+        for weight in (1, 1000):
+            with self.subTest(weight=weight):
+                self.domain = Domain()
+                self.domain.memory = 1169180
+                self.domain.usable = self.domain.memory - 262144
+                self.controller.memory_targets.clear()
+                self.controller.pending_targets.clear()
+                self.controller.control_samples.clear()
+                self.controller.config["vms"][0]["memory_weight"] = weight
+                for _ in range(5):
+                    self.step()
+                    self.assertGreaterEqual(self.domain.memory, 1165084)
+                    self.assertGreaterEqual(self.domain.usable, 524288)
+                self.assertEqual(self.domain.memory, 1165084)
 
     def test_ewma_smooths_non_emergency_spike(self):
         self.domain.memory = 4194304
@@ -497,6 +615,45 @@ class AdaptiveControllerTests(unittest.TestCase):
                          ["guest-idle", "guest-a", "guest-busy"])
         self.assertTrue(all(call.args[1] == 0.5 for call in process.call_args_list))
 
+    def test_poll_prioritizes_yield_score_and_leaves_zero_idle_last(self):
+        secondary = Domain("secondary")
+        secondary.memory, secondary.usable = 1000000, 400000
+        critical = Domain("critical")
+        critical.memory, critical.usable = 1000000, 600000
+        busy = Domain("busy")
+        busy.usable = 0
+        self.controller.config["default"]["memory_weight"] = 1000
+        self.controller.config["vms"].extend([
+            {"name": "secondary", "memory_weight": 50},
+            {"name": "critical", "memory_weight": 200},
+            {"name": "busy", "memory_weight": 1},
+        ])
+        self.controller.monitored_vms.update(("secondary", "critical", "busy"))
+        self.controller.conn = Mock()
+        self.controller.conn.listDomainsID.return_value = [1, 2, 3, 4]
+        self.controller.conn.lookupByID.side_effect = [critical, busy, self.domain, secondary]
+        with patch.object(self.controller, "host_memory_pressure", return_value=1):
+            with patch.object(self.controller, "process_domainID") as process:
+                self.controller.process_domains()
+        self.assertEqual([call.args[0].name() for call in process.call_args_list],
+                         ["secondary", "critical", "guest-a", "busy"])
+
+    def test_memory_weight_requires_integer_from_one_to_one_thousand(self):
+        for scope in ("default", "vm"):
+            for value in (0, -1, 1001, 100.0, True, False, None, "100"):
+                with self.subTest(scope=scope, value=value):
+                    config = {"default": {}, "vms": []}
+                    if scope == "default":
+                        config["default"]["memory_weight"] = value
+                    else:
+                        config["vms"] = [{"name": "guest-a", "memory_weight": value}]
+                    with self.assertRaisesRegex(autoballoon.ExitFailure, "memory_weight"):
+                        self.controller._LibVirtAutoBalloon__validate_config_parameters(config)
+        for value in (1, 100, 1000):
+            config = {"default": {"memory_weight": value},
+                      "vms": [{"name": "guest-a", "memory_weight": value}]}
+            self.controller._LibVirtAutoBalloon__validate_config_parameters(config)
+
     def test_invalid_controller_parameters_are_rejected(self):
         for key, values in {
                 "ewma_alpha": (0, -0.1, 1.1, True, None, float("nan")),
@@ -527,7 +684,8 @@ class AdaptiveControllerTests(unittest.TestCase):
                         self.controller._LibVirtAutoBalloon__validate_config_parameters(config)
 
     def test_general_rejects_vm_and_unknown_settings(self):
-        for parameters in ({"keep_free_kb": 524288}, {"balloon": True}, {"psi_threshol": 5}):
+        for parameters in ({"keep_free_kb": 524288}, {"balloon": True},
+                           {"memory_weight": 100}, {"psi_threshol": 5}):
             with self.subTest(parameters=parameters):
                 config = {"general": parameters, "vms": []}
                 with self.assertRaisesRegex(autoballoon.ExitFailure, "Unsupported general parameters"):
@@ -556,6 +714,7 @@ class LifecycleTests(unittest.TestCase):
             open=Mock(return_value=self.conn),
             virEventRegisterDefaultImpl=Mock(),
             virEventAddTimeout=Mock(return_value=7),
+            virEventUpdateTimeout=Mock(),
             virEventRemoveTimeout=Mock(),
             virEventRunDefaultImpl=Mock(),
         )
@@ -679,6 +838,80 @@ class LifecycleTests(unittest.TestCase):
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_RESUMED)
         self.config_open.assert_not_called()
 
+    def test_poll_interval_tracks_discovery_period_changes_and_removal(self):
+        slow = Mock()
+        slow.name.return_value = "guest-slow"
+        slow.XMLDesc.return_value = (
+            "<domain><devices><memballoon><stats period='5'/>"
+            "</memballoon></devices></domain>")
+        self.conn.listAllDomains.return_value = [slow]
+        self.controller.dom_print_names()
+        self.assertEqual(self.controller.poll_interval, 5)
+        self.libvirt.virEventUpdateTimeout.assert_not_called()
+        self.controller.timer_id = 7
+
+        self.domain.XMLDesc.return_value = (
+            "<domain><devices><memballoon><stats period='1'/>"
+            "</memballoon></devices></domain>")
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
+        self.assertEqual(self.controller.poll_interval, 1)
+        self.libvirt.virEventUpdateTimeout.assert_called_once_with(7, 1000)
+        self.libvirt.virEventUpdateTimeout.reset_mock()
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_RESUMED)
+        self.libvirt.virEventUpdateTimeout.assert_not_called()
+
+        self.domain.XMLDesc.return_value = (
+            "<domain><devices><memballoon><stats period='3'/>"
+            "</memballoon></devices></domain>")
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
+        self.assertEqual(self.controller.poll_interval, 3)
+        self.libvirt.virEventUpdateTimeout.assert_called_once_with(7, 3000)
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STOPPED)
+        self.assertNotIn("guest-new", self.controller.stats_periods)
+        self.assertEqual(self.controller.poll_interval, 5)
+        self.libvirt.virEventUpdateTimeout.assert_called_with(7, 5000)
+
+        self.conn.listAllDomains.return_value = []
+        self.controller.dom_print_names()
+        self.assertEqual(self.controller.stats_periods, {})
+        self.assertEqual(self.controller.poll_interval, 5)
+        self.libvirt.virEventUpdateTimeout.assert_called_with(7, 5000)
+
+    def test_excluded_or_invalid_periods_do_not_affect_poll_interval(self):
+        excluded = Mock()
+        excluded.name.return_value = "guest-excluded"
+        excluded.XMLDesc.return_value = (
+            "<domain><devices><memballoon><stats period='1'/>"
+            "</memballoon></devices></domain>")
+        self.controller.config["vms"] = [{"name": "guest-excluded", "balloon": False}]
+        self.domain.XMLDesc.return_value = (
+            "<domain><devices><memballoon><stats period='5'/>"
+            "</memballoon></devices></domain>")
+        self.conn.listAllDomains.return_value = [excluded, self.domain]
+        self.controller.dom_print_names()
+        self.assertEqual(self.controller.poll_interval, 5)
+        self.assertEqual(self.controller.stats_periods, {"guest-new": 5})
+
+        self.domain.XMLDesc.return_value = "<domain/>"
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
+        self.assertEqual(self.controller.poll_interval, 5)
+        self.assertEqual(self.controller.stats_periods, {})
+
+    def test_config_reload_recalculates_minimum_period(self):
+        self.domain.XMLDesc.return_value = (
+            "<domain><devices><memballoon><stats period='1'/>"
+            "</memballoon></devices></domain>")
+        self.controller.dom_print_names()
+        self.assertEqual(self.controller.poll_interval, 1)
+        self.controller.timer_id = 7
+        self.config_open.return_value.read.return_value = (
+            '{"default": {"balloon": false}, "vms": []}')
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
+        self.assertEqual(self.controller.monitored_vms, set())
+        self.assertEqual(self.controller.stats_periods, {})
+        self.assertEqual(self.controller.poll_interval, 5)
+        self.libvirt.virEventUpdateTimeout.assert_called_once_with(7, 5000)
+
     def test_unavailable_domain_does_not_break_event_dispatch(self):
         self.domain.name.side_effect = self.libvirt.libvirtError("domain disappeared")
         with self.assertLogs(level="WARNING") as logs:
@@ -711,10 +944,24 @@ class LifecycleTests(unittest.TestCase):
         self.libvirt.open.assert_called_once_with("qemu:///system")
         self.libvirt.virEventRegisterDefaultImpl.assert_called_once_with()
         self.assertEqual(self.conn.mock_calls[0][0], "domainEventRegisterAny")
-        self.assertEqual(self.libvirt.virEventAddTimeout.call_args.args[0], 2000)
+        self.assertEqual(self.libvirt.virEventAddTimeout.call_args.args[0], 5000)
+        self.libvirt.virEventUpdateTimeout.assert_called_once_with(7, 2000)
         self.controller.process_domainID.assert_called_once_with(self.domain, 0.5, memstat)
         self.libvirt.virEventRemoveTimeout.assert_called_once_with(7)
         self.conn.domainEventDeregisterAny.assert_called_once_with(3)
+
+    def test_daemon_registers_timer_with_discovered_minimum_period(self):
+        self.domain.XMLDesc.return_value = (
+            "<domain><devices><memballoon><stats period='5'/>"
+            "</memballoon></devices></domain>")
+        self.controller.process_domains = Mock()
+        self.libvirt.virEventRunDefaultImpl.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.controller.daemon()
+        self.assertEqual(self.libvirt.virEventAddTimeout.call_args.args[0], 5000)
+        self.libvirt.virEventUpdateTimeout.assert_not_called()
+        self.libvirt.virEventRemoveTimeout.assert_called_once_with(7)
+        self.assertIsNone(self.controller.timer_id)
 
     def test_event_loop_failure_is_reported_and_registrations_are_removed(self):
         self.conn.domainEventRegisterAny.return_value = 3

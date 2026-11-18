@@ -23,9 +23,11 @@ VM is not monitored. `autodeflate='on'` is recommended, but optional; its
 absence produces a warning only.
 
 The daemon uses `libvirt-python` with one persistent connection to
-`qemu:///system`. Memory is checked every 2 seconds using libvirt's event loop.
-Guest statistics still update at the XML stats period; a 1- or 2-second period
-provides fresher data for this interval.
+`qemu:///system`. The polling interval is the minimum XML stats period among
+monitored VMs, using libvirt's event loop. Discovery, definition changes, and
+removal of VMs recalculate the interval and update the running timer without
+restarting the daemon. With no monitored VMs, the interval is 5 seconds.
+Each VM is controlled only when its own statistics have updated.
 
 After an initial inventory, libvirt lifecycle events discover newly defined
 or started VMs and recheck their monitoring requirements without restarting
@@ -57,17 +59,18 @@ values. If `balloon` is omitted from both places, it defaults to `false`.
 	},
 	"default": {
 		"balloon": true,
+		"memory_weight": 100,
 		"keep_free_kb": 524288,
 		"keep_free_ratio": 0.1,
 		"ewma_alpha": 0.3,
-		"reclaim_ratio": 0.03,
+		"reclaim_ratio": 0.015,
 		"pd_kp": 0.5,
 		"pd_kd": 1.0,
 		"manual_increase_grace_seconds": 600
 	},
 	"vms": [
 		{"name": "guest-a", "balloon": false},
-		{"name": "guest-b", "keep_free_kb": 1048576}
+		{"name": "guest-b", "keep_free_kb": 1048576, "memory_weight": 500}
 	]
 }
 ```
@@ -77,13 +80,18 @@ of KiB. It must be at least `262144` KiB (256 MiB); smaller values are invalid.
 It defaults to 512 MiB (`524288` KiB), regardless of the
 VM's total memory. A per-VM value overrides the default.
 
+`memory_weight` is an integer from 1 to 1000, defaulting to `100`. It can be
+set in `default` and overridden per VM. Higher weights protect critical VMs
+from reclaim; lower weights make secondary VMs yield sooner and faster.
+Weights do not reduce the reserve or floor and do not limit emergency growth.
+
 The following finite numeric settings can also be overridden per VM:
 
 | Setting | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `keep_free_ratio` | `0.1` | 0 to 1 | Proportional usable-memory reserve |
 | `ewma_alpha` | `0.3` | Greater than 0, at most 1 | Weight of the newest working-set sample |
-| `reclaim_ratio` | `0.03` | Greater than 0, at most 0.05 | Maximum fraction of current RAM reclaimed per fresh sample |
+| `reclaim_ratio` | `0.015` | Greater than 0, at most 0.05 | Base fraction of current RAM reclaimed per second, before weight scaling |
 | `pd_kp` | `0.5` | Greater than 0, at most 1 | Proportional gain |
 | `pd_kd` | `1.0` | 0 to 10 seconds | Derivative gain; 0 disables derivative braking |
 
@@ -136,6 +144,9 @@ dated in the future produce a warning and are skipped. A backwards timestamp
 resets the filter. Lifecycle transitions and configuration changes reset
 controller history, without discarding existing manual-increase grace periods.
 The status command's `Keep_Usable` column shows the effective reserve.
+Its `Weight` column shows the effective `memory_weight`, including inheritance
+from `default` or the built-in default of 100. Higher weights mean higher
+priority when protecting memory from reclaim; the weight is dimensionless.
 
 ### Slow reclaim, rapid growth
 
@@ -194,15 +205,42 @@ Reclaim increases continuously as available RAM falls below that safety buffer,
 or PSI rises toward 5%. Both thresholds are configurable in `general`.
 An `avg10` value of `5` means 5%, not a fraction.
 
-VMs are processed in descending idle ratio (`usable / actual`). Each reclaim
-is bounded by the negative PD correction, the safely reclaimable surplus, and:
+VMs are processed in descending yield score:
 
 ```
-actual * reclaim_ratio * Pressure * idle_ratio
+idle_ratio = usable / actual
+weight_factor = memory_weight / 100.0
+yield_score = idle_ratio / weight_factor
 ```
 
-Thus idle guests yield first and more aggressively, while busy guests retain
-their reserve. If PSI or host memory data is unavailable or invalid, an error
+For example, idle ratio 0.4 with weight 50 scores 0.8, ahead of idle ratio
+0.6 with weight 200, which scores 0.3. Zero idle memory scores zero regardless
+of weight.
+
+Each reclaim is bounded by the negative PD correction, the safely reclaimable
+surplus, and:
+
+```
+actual * reclaim_ratio * Elapsed * Pressure * idle_ratio * min(2.0, 100.0 / memory_weight)
+```
+
+`Elapsed` is the time in seconds between this VM's fresh guest-statistics
+samples, bounded below by one second. The first sample uses the VM's XML stats
+period. This keeps the base reclaim rate independent of the polling interval
+and of other VMs' stats periods.
+
+`reclaim_ratio` is now a per-second rate, rather than a per-sample fraction.
+The new default `0.015` preserves the old default's base rate at a 2-second
+stats period. Divide an existing explicit value by 2 to preserve its base rate
+at that period (for example, change `0.03` to `0.015`).
+
+Weight 100 preserves the normal rate. Weight 500 reclaims at one fifth of that
+rate, while weights of 50 or less are capped at twice the base rate. Emergency
+growth due to a low reserve or rapid consumption remains independent of weight,
+and all weights retain the same reserve and floor protections.
+
+Thus idle, lower-priority guests yield first and more aggressively. If PSI or
+host memory data is unavailable or invalid, an error
 is logged and reclaim is disabled for that cycle. Guest growth remains enabled;
 the daemon retries host statistics on the next cycle.
 

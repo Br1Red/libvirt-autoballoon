@@ -27,13 +27,15 @@ class ExitFailure(Exception):
     pass
 
 class LibVirtAutoBalloon:
-    sleep_time = 2
+    poll_interval = 5
     conn = None
     config = None
 
     def __init__(self, qemu_addr='qemu:///system', configfile='/etc/libvirt/autoballoon.json'):
         self.configfile = configfile
         self.monitored_vms = set()
+        self.stats_periods = {}
+        self.timer_id = None
         self.memory_targets = {}
         self.pending_targets = {}
         self.manual_increase_until = {}
@@ -80,6 +82,12 @@ class LibVirtAutoBalloon:
             for vm in config["vms"]
         )
         for scope, parameters in configurations:
+            memory_weight = parameters.get("memory_weight", 100)
+            if (isinstance(memory_weight, bool)
+                    or not isinstance(memory_weight, int)
+                    or not 1 <= memory_weight <= 1000):
+                raise ExitFailure(
+                    "Invalid {} memory_weight: expected an integer from 1 to 1000".format(scope))
             keep_free_kb = parameters.get("keep_free_kb")
             if keep_free_kb is not None and (
                     isinstance(keep_free_kb, bool)
@@ -136,12 +144,15 @@ class LibVirtAutoBalloon:
         used = actual - usable
         total_ram = dom.info()[1]
         keep_usable = self.dom_keep_usable(dom, actual)
-        print(dom.name(),
+        name = dom.name()
+        memory_weight = self.__vm_config_for_name(name).get("memory_weight", 100)
+        print(name,
               int(total_ram / SZ_1MiB),
               int(actual / SZ_1MiB),
               int(used / SZ_1MiB),
               int(usable / SZ_1MiB),
               int(keep_usable / SZ_1MiB),
+              memory_weight,
               "MiB", sep='\t', flush=True)
 
     def status(self):
@@ -149,7 +160,8 @@ class LibVirtAutoBalloon:
         domainIDs = self.conn.listDomainsID()
         if domainIDs is None:
             raise ExitFailure('No active domains')
-        print("Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Units", sep='\t', flush=True)
+        print("Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Weight", "Units",
+              sep='\t', flush=True)
         for domainID in domainIDs:
             dom = self.conn.lookupByID(domainID)
             if dom.name() in self.monitored_vms:
@@ -218,6 +230,7 @@ class LibVirtAutoBalloon:
         error = reserve - (actual - used_ewma)
         derivative = 0
         used_rate = 0
+        elapsed = self.stats_periods.get(name, self.poll_interval)
         if previous is not None:
             elapsed = max(1, updated - previous.updated)
             derivative = (error - previous.error) / elapsed
@@ -228,7 +241,7 @@ class LibVirtAutoBalloon:
         delta = parameters.get("pd_kp", 0.5) * error + derivative_term
         emergency = usable < reserve or used_rate > actual * 0.05
         if emergency:
-            delta = max(delta, reserve - usable + max(0, used_rate) * self.sleep_time,
+            delta = max(delta, reserve - usable + max(0, used_rate) * self.poll_interval,
                         actual * 0.25)
         elif error <= 0:
             delta = min(delta, 0)
@@ -244,7 +257,10 @@ class LibVirtAutoBalloon:
             if host_pressure is None:
                 host_pressure = self.host_memory_pressure()
             idle_ratio = usable / actual
-            reclaim_limit = actual * parameters.get("reclaim_ratio", 0.03) * host_pressure * idle_ratio
+            weight_multiplier = min(2.0, 100.0 / parameters.get("memory_weight", 100))
+            reclaim_limit = (
+                actual * parameters.get("reclaim_ratio", 0.015) * elapsed * host_pressure * idle_ratio
+                * weight_multiplier)
             surplus = max(0, min(usable - reserve, -error))
             delta = -min(-delta, reclaim_limit, surplus)
         target = min(info[1], max(floor, actual + int(delta)))
@@ -299,12 +315,15 @@ class LibVirtAutoBalloon:
         for domainID in domainIDs:
             try:
                 dom = self.conn.lookupByID(domainID)
-                if dom.name() not in self.monitored_vms:
+                name = dom.name()
+                if name not in self.monitored_vms:
                     continue
                 memstat = dom.memoryStats()
                 actual = memstat.get("actual", 0)
                 idle_ratio = memstat.get("usable", 0) / actual if actual > 0 else 0
-                domains.append((idle_ratio, dom, memstat))
+                memory_weight = self.__vm_config_for_name(name).get("memory_weight", 100)
+                yield_score = idle_ratio / (memory_weight / 100.0)
+                domains.append((yield_score, dom, memstat))
             except libvirt.libvirtError as error:
                 logging.warning("%s stopped or unavailable, skipping: %s", domainID, error)
         pressure = self.host_memory_pressure() if domains else 0.0
@@ -318,12 +337,23 @@ class LibVirtAutoBalloon:
         domains = self.conn.listAllDomains()
         domainNames = [dom.name() for dom in domains]
         self.monitored_vms = set()
+        self.stats_periods.clear()
         logging.debug("Found domains: %s", domainNames)
         for dom in domains:
             self.__refresh_domain(dom)
+        self.__update_poll_interval()
+
+    def __update_poll_interval(self):
+        interval = min(self.stats_periods.values(), default=5)
+        if interval != self.poll_interval:
+            self.poll_interval = interval
+            logging.info("Polling interval changed to %s seconds", interval)
+            if self.timer_id is not None:
+                libvirt.virEventUpdateTimeout(self.timer_id, interval * 1000)
 
     def __forget_domain(self, name):
         self.monitored_vms.discard(name)
+        self.stats_periods.pop(name, None)
         self.memory_targets.pop(name, None)
         self.pending_targets.pop(name, None)
         self.manual_increase_until.pop(name, None)
@@ -363,6 +393,7 @@ class LibVirtAutoBalloon:
         print("Monitoring {}".format(name), flush=True)
         if balloon.get("autodeflate") != "on":
             print("{}: autodeflate='on' is recommended, but is not set".format(name), flush=True)
+        self.stats_periods[name] = stats_period
         return True
 
     def __domain_lifecycle(self, conn, dom, event, detail, opaque):
@@ -388,6 +419,7 @@ class LibVirtAutoBalloon:
                     self.__refresh_domain(dom)
                 else:
                     self.__forget_domain(dom.name())
+            self.__update_poll_interval()
         except libvirt.libvirtError as error:
             logging.warning("Cannot update domain monitoring after lifecycle event: %s", error)
 
@@ -406,12 +438,11 @@ class LibVirtAutoBalloon:
         print("Starting daemon", flush=True)
         callback_id = self.conn.domainEventRegisterAny(
             None, libvirt.VIR_DOMAIN_EVENT_ID_LIFECYCLE, self.__domain_lifecycle, None)
-        timer_id = None
         try:
             self.dom_print_names()
             self.poll_due = True
-            timer_id = libvirt.virEventAddTimeout(
-                self.sleep_time * 1000, self.__poll_timeout, None)
+            self.timer_id = libvirt.virEventAddTimeout(
+                self.poll_interval * 1000, self.__poll_timeout, None)
             while True:
                 if self.poll_due:
                     self.poll_due = False
@@ -419,8 +450,9 @@ class LibVirtAutoBalloon:
                 if libvirt.virEventRunDefaultImpl() < 0:
                     raise ExitFailure("Libvirt event loop failed")
         finally:
-            if timer_id is not None:
-                libvirt.virEventRemoveTimeout(timer_id)
+            if self.timer_id is not None:
+                libvirt.virEventRemoveTimeout(self.timer_id)
+                self.timer_id = None
             self.conn.domainEventDeregisterAny(callback_id)
 
 def dom_balloon(dom, restrict_to, actual, total_ram):
