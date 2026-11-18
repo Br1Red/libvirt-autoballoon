@@ -1,7 +1,9 @@
 import importlib.util
+import io
 import sys
 import types
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import Mock, mock_open, patch
 
 
@@ -34,6 +36,20 @@ class Domain:
         self.calls.append(target)
         self.usable += target - self.memory
         self.memory = target
+
+
+class LogFormattingTests(unittest.TestCase):
+    def test_only_info_messages_omit_level_prefix(self):
+        formatter = autoballoon.LogFormatter("%(levelname)s %(message)s")
+        for level, expected in (
+                (autoballoon.logging.INFO, "Monitoring guest-a"),
+                (autoballoon.logging.DEBUG, "DEBUG Monitoring guest-a"),
+                (autoballoon.logging.WARNING, "WARNING Monitoring guest-a"),
+                (autoballoon.logging.ERROR, "ERROR Monitoring guest-a")):
+            with self.subTest(level=level):
+                record = autoballoon.logging.LogRecord(
+                    "autoballoon", level, __file__, 1, "Monitoring %s", ("guest-a",), None)
+                self.assertEqual(formatter.format(record), expected)
 
 
 class BalloonAdjustmentTests(unittest.TestCase):
@@ -118,12 +134,43 @@ class AdaptiveControllerTests(unittest.TestCase):
                 self.controller.conn = Mock()
                 self.controller.conn.listDomainsID.return_value = [1]
                 self.controller.conn.lookupByID.return_value = self.domain
-                with patch.object(self.controller, "dom_print_names"), patch("builtins.print") as output:
+                output = io.StringIO()
+                with patch.object(self.controller, "dom_print_names"), redirect_stdout(output):
                     self.controller.status()
-                self.assertEqual([call.args for call in output.call_args_list], [
-                    ("Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Weight", "Units"),
-                    ("guest-a", 8192, 1024, 512, 512, 512, expected, "MiB"),
+                self.assertEqual([line.split() for line in output.getvalue().splitlines()], [
+                    ["Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Weight", "Units"],
+                    ["guest-a", "8192", "1024", "512", "512", "512", str(expected), "MiB"],
                 ])
+
+    def test_status_aligns_columns_for_long_names_and_large_numbers(self):
+        long_domain = Domain("Windows11Professional-Lavoro")
+        long_domain.maximum = 1048576 * 1024
+        self.controller.monitored_vms.add(long_domain.name())
+        self.controller.conn = Mock()
+        self.controller.conn.listDomainsID.return_value = [1, 2]
+        self.controller.conn.lookupByID.side_effect = [self.domain, long_domain]
+        output = io.StringIO()
+        with patch.object(self.controller, "dom_print_names"), redirect_stdout(output):
+            self.controller.status()
+        lines = output.getvalue().splitlines()
+        self.assertNotIn("\t", output.getvalue())
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[1].index("8192"), lines[2].index("1048576") + 3)
+        self.assertEqual(lines[0].index("Total") + 5, lines[2].index("1048576") + 7)
+        for line in lines[1:]:
+            self.assertEqual(line.index("MiB"), lines[0].index("Units"))
+        self.assertTrue(lines[2].startswith(long_domain.name() + "  "))
+
+    def test_status_with_no_active_domains_prints_only_header(self):
+        self.controller.conn = Mock()
+        self.controller.conn.listDomainsID.return_value = []
+        output = io.StringIO()
+        with patch.object(self.controller, "dom_print_names"), redirect_stdout(output):
+            self.controller.status()
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertEqual(output.getvalue().split(), [
+            "Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Weight", "Units",
+        ])
 
     def test_no_change_at_reserve(self):
         self.domain.memory = 1310720
@@ -737,6 +784,38 @@ class LifecycleTests(unittest.TestCase):
         self.controller._LibVirtAutoBalloon__domain_lifecycle(
             self.conn, self.domain, event, 0, None)
 
+    def test_status_cli_only_prints_table_even_with_excluded_domains(self):
+        self.domain.info.return_value = (1, 8388608, 1048576, 1, 0)
+        self.domain.memoryStats.return_value = {"actual": 1048576, "usable": 524288}
+        excluded = Mock()
+        excluded.name.return_value = "excluded"
+        self.config_open.return_value.read.return_value = (
+            '{"default": {"balloon": true}, '
+            '"vms": [{"name": "excluded", "balloon": false}]}')
+        self.conn.listAllDomains.return_value = [self.domain, excluded]
+        self.conn.listDomainsID.return_value = [1]
+        self.conn.lookupByID.return_value = self.domain
+        for debug in (False, True):
+            with self.subTest(debug=debug):
+                output, errors = io.StringIO(), io.StringIO()
+                root = autoballoon.logging.getLogger()
+                previous_level = root.level
+                try:
+                    with patch.object(root, "handlers", []):
+                        with redirect_stdout(output), redirect_stderr(errors):
+                            autoballoon.libvirt_autoballoon(
+                                ["libvirt-autoballoon"] + (["--debug"] if debug else []) + ["status"])
+                finally:
+                    root.setLevel(previous_level)
+                self.assertEqual(len(output.getvalue().splitlines()), 2)
+                self.assertEqual(output.getvalue().splitlines()[0].split()[0], "Domain")
+                if debug:
+                    self.assertIn("Connecting to libvirt at qemu:///system",
+                                  errors.getvalue().splitlines())
+                    self.assertIn("Monitoring guest-new", errors.getvalue().splitlines())
+                else:
+                    self.assertEqual(errors.getvalue(), "")
+
     def test_new_domains_follow_selection_and_xml_requirements(self):
         for event in (self.libvirt.VIR_DOMAIN_EVENT_DEFINED,
                       self.libvirt.VIR_DOMAIN_EVENT_STARTED,
@@ -837,6 +916,54 @@ class LifecycleTests(unittest.TestCase):
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_RESUMED)
         self.config_open.assert_not_called()
+
+    def test_monitoring_logs_only_changes_across_reload_and_lifecycle_events(self):
+        with patch.object(autoballoon.logging, "info") as info:
+            self.controller.dom_print_names()
+            info.assert_any_call("Monitoring %s", "guest-new")
+            info.reset_mock()
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_RESUMED)
+            self.assertFalse(any("Monitoring" in call.args[0] for call in info.call_args_list))
+
+            info.reset_mock()
+            self.config_open.return_value.read.return_value = (
+                '{"default": {"balloon": false}, "vms": []}')
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
+            info.assert_any_call("Stopped monitoring %s", "guest-new")
+            info.reset_mock()
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
+            self.assertFalse(any("monitoring" in call.args[0].lower()
+                                 for call in info.call_args_list))
+
+            info.reset_mock()
+            self.config_open.return_value.read.return_value = (
+                '{"default": {"balloon": true}, "vms": []}')
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
+            info.assert_any_call("Monitoring %s", "guest-new")
+            info.reset_mock()
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STOPPED)
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STOPPED)
+            self.assertEqual(
+                [call.args for call in info.call_args_list if "monitoring" in call.args[0]],
+                [("Stopped monitoring %s", "guest-new")])
+
+    def test_inventory_removal_logs_once_and_clears_tracking(self):
+        self.controller.dom_print_names()
+        self.controller.memory_targets["guest-new"] = 1048576
+        self.controller.manual_increase_until["guest-new"] = 3600
+        self.conn.listAllDomains.return_value = []
+        with patch.object(autoballoon.logging, "info") as info:
+            self.controller.dom_print_names()
+            self.controller.dom_print_names()
+        self.assertEqual(
+            [call.args for call in info.call_args_list if "monitoring" in call.args[0]],
+            [("Stopped monitoring %s", "guest-new")])
+        self.assertNotIn("guest-new", self.controller.monitored_vms)
+        self.assertNotIn("guest-new", self.controller.stats_periods)
+        self.assertNotIn("guest-new", self.controller.memory_targets)
+        self.assertNotIn("guest-new", self.controller.manual_increase_until)
 
     def test_poll_interval_tracks_discovery_period_changes_and_removal(self):
         slow = Mock()

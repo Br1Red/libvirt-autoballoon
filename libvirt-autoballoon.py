@@ -26,6 +26,12 @@ class MemorySample(NamedTuple):
 class ExitFailure(Exception):
     pass
 
+class LogFormatter(logging.Formatter):
+    def formatMessage(self, record):
+        if record.levelno == logging.INFO:
+            return record.message
+        return super().formatMessage(record)
+
 class LibVirtAutoBalloon:
     poll_interval = 5
     conn = None
@@ -41,7 +47,7 @@ class LibVirtAutoBalloon:
         self.manual_increase_until = {}
         self.control_samples = {}
         libvirt.virEventRegisterDefaultImpl()
-        print("Connecting to libvirt at {}".format(qemu_addr), flush=True)
+        logging.info("Connecting to libvirt at %s", qemu_addr)
         self.conn = libvirt.open(qemu_addr)
         if self.conn is None:
             raise ExitFailure('Failed to open connection to the hypervisor')
@@ -52,7 +58,7 @@ class LibVirtAutoBalloon:
             raise
 
     def __load_config(self):
-        print("Loading config file: {}".format(self.configfile), flush=True)
+        logging.info("Loading config file: %s", self.configfile)
         with open(self.configfile) as configfile:
             config = json.load(configfile, parse_int=int)
         self.__validate_config_parameters(config)
@@ -146,26 +152,33 @@ class LibVirtAutoBalloon:
         keep_usable = self.dom_keep_usable(dom, actual)
         name = dom.name()
         memory_weight = self.__vm_config_for_name(name).get("memory_weight", 100)
-        print(name,
-              int(total_ram / SZ_1MiB),
-              int(actual / SZ_1MiB),
-              int(used / SZ_1MiB),
-              int(usable / SZ_1MiB),
-              int(keep_usable / SZ_1MiB),
-              memory_weight,
-              "MiB", sep='\t', flush=True)
+        return (
+            name,
+            str(int(total_ram / SZ_1MiB)),
+            str(int(actual / SZ_1MiB)),
+            str(int(used / SZ_1MiB)),
+            str(int(usable / SZ_1MiB)),
+            str(int(keep_usable / SZ_1MiB)),
+            str(memory_weight),
+            "MiB",
+        )
 
     def status(self):
         self.dom_print_names()
         domainIDs = self.conn.listDomainsID()
         if domainIDs is None:
             raise ExitFailure('No active domains')
-        print("Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Weight", "Units",
-              sep='\t', flush=True)
+        rows = [("Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Weight", "Units")]
         for domainID in domainIDs:
             dom = self.conn.lookupByID(domainID)
             if dom.name() in self.monitored_vms:
-                self.dom_status(dom)
+                rows.append(self.dom_status(dom))
+        widths = [max(len(value) for value in column) for column in zip(*rows)]
+        for row in rows:
+            print("  ".join(
+                value.ljust(width) if index in (0, len(row) - 1) else value.rjust(width)
+                for index, (value, width) in enumerate(zip(row, widths))
+            ).rstrip(), flush=True)
 
     def process_domainID(self, dom, host_pressure=None, memstat=None):
         name = dom.name()
@@ -336,7 +349,8 @@ class LibVirtAutoBalloon:
     def dom_print_names(self):
         domains = self.conn.listAllDomains()
         domainNames = [dom.name() for dom in domains]
-        self.monitored_vms = set()
+        for name in self.monitored_vms - set(domainNames):
+            self.__forget_domain(name)
         self.stats_periods.clear()
         logging.debug("Found domains: %s", domainNames)
         for dom in domains:
@@ -352,6 +366,8 @@ class LibVirtAutoBalloon:
                 libvirt.virEventUpdateTimeout(self.timer_id, interval * 1000)
 
     def __forget_domain(self, name):
+        if name in self.monitored_vms:
+            logging.info("Stopped monitoring %s", name)
         self.monitored_vms.discard(name)
         self.stats_periods.pop(name, None)
         self.memory_targets.pop(name, None)
@@ -362,6 +378,8 @@ class LibVirtAutoBalloon:
     def __refresh_domain(self, dom):
         name = dom.name()
         if self.__can_monitor_domain(dom):
+            if name not in self.monitored_vms:
+                logging.info("Monitoring %s", name)
             self.monitored_vms.add(name)
         else:
             self.__forget_domain(name)
@@ -369,7 +387,6 @@ class LibVirtAutoBalloon:
     def __can_monitor_domain(self, dom):
         name = dom.name()
         if self.__vm_config_for_name(name).get("balloon", False) is not True:
-            print("Not monitoring {}: not selected for monitoring".format(name), flush=True)
             return False
         try:
             domain_xml = ET.fromstring(dom.XMLDesc(0))
@@ -390,7 +407,6 @@ class LibVirtAutoBalloon:
             print("Not monitoring {}: invalid balloon stats period {!r}, expected 1 to 5".format(
                 name, raw_period), flush=True)
             return False
-        print("Monitoring {}".format(name), flush=True)
         if balloon.get("autodeflate") != "on":
             print("{}: autodeflate='on' is recommended, but is not set".format(name), flush=True)
         self.stats_periods[name] = stats_period
@@ -489,9 +505,12 @@ def libvirt_autoballoon(argv):
                         help="enable debug output")
     parser.add_argument("action", choices=("start", "status"), help="start daemon or show status")
     args = parser.parse_args(argv[1:])
+    handler = logging.StreamHandler()
+    handler.setFormatter(LogFormatter("%(levelname)s %(message)s"))
     logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.WARNING,
-        format="%(levelname)s %(message)s")
+        level=(logging.DEBUG if args.debug else
+               logging.INFO if args.action == "start" else logging.WARNING),
+        handlers=[handler])
     previous_sigterm = signal.signal(signal.SIGTERM, handle_sigterm)
     try:
         lv_ctrl = LibVirtAutoBalloon(configfile=args.config)

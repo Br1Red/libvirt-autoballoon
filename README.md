@@ -37,6 +37,10 @@ does not stop monitoring it. Whenever a VM starts, the daemon reloads the
 configuration file and rechecks monitoring for all VMs. The updated settings
 also apply to guests that are already running. If the file cannot be read or
 is invalid, the daemon logs an error and keeps the previous valid configuration.
+Monitoring messages list the initial monitored VMs, then only changes:
+`Monitoring <name>` when a VM enters monitoring and `Stopped monitoring <name>`
+when it leaves. Configuration reloads and repeated lifecycle events do not
+repeat these messages for unchanged VMs.
 
 ## Configuration
 
@@ -47,6 +51,14 @@ different file with `-c` or `--config`:
 libvirt-autoballoon --config /path/to/autoballoon.json start
 libvirt-autoballoon -c /path/to/autoballoon.json status
 ```
+
+`status` displays an aligned table of active monitored VMs, with memory values
+in MiB and the effective memory weight. Column widths adapt to domain names and
+values. Connection, configuration-loading, and monitoring messages are hidden
+by default; warnings and errors remain visible. Use `--debug status` to include
+diagnostic messages on stderr. The `start` command retains informational logs.
+Informational messages have no level prefix; other log levels retain their
+prefixes (`DEBUG`, `WARNING`, `ERROR`).
 
 The `default` section supplies values for every VM. A VM entry overrides those
 values. If `balloon` is omitted from both places, it defaults to `false`.
