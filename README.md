@@ -21,9 +21,19 @@ missing, non-numeric, zero, or greater-than-5 period produces a warning and the
 VM is not monitored. `autodeflate='on'` is recommended, but optional; its
 absence produces a warning only.
 
-The daemon takes its VM inventory at startup. A VM must already be defined in
-libvirt when the daemon starts; it may be powered off and will be monitored when
-it is later started. Restart the daemon to include VMs defined after startup.
+The daemon uses `libvirt-python` with one persistent connection to
+`qemu:///system`; it does not invoke `virsh`. Memory is checked every 2 seconds
+using libvirt's event loop. Guest statistics still update at the XML stats
+period; a 1- or 2-second period provides fresher data for this interval.
+
+After an initial inventory, libvirt lifecycle events discover newly defined
+or started VMs and recheck their monitoring requirements without restarting
+the daemon. Stopped, crashed, or removed VMs have their tracking state cleared;
+restarting a VM starts fresh manual-increase tracking. Undefining a running VM
+does not stop monitoring it. Whenever a VM starts, the daemon reloads the
+configuration file and rechecks monitoring for all VMs. The updated settings
+also apply to guests that are already running. If the file cannot be read or
+is invalid, the daemon logs an error and keeps the previous valid configuration.
 
 ## Configuration
 
@@ -79,13 +89,17 @@ per VM (or in `default`) to the desired number of seconds; `3600` gives one
 hour. During that time the daemon can still increase memory if the VM needs it.
 It defaults to `0` (no delay) and must be a non-negative integer. The daemon
 starts tracking at launch, so increases made before it starts are not detected.
-Restart the service after changing the configuration.
+Configuration changes take effect when the next VM starts, or after restarting
+the service.
 
 The RAM target is at least $2K$, but is capped at the VM's maximum memory. If
 that maximum is below $2K$, the daemon uses the maximum available value and
 cannot maintain the configured reserve.
 
 # Installation
+
+Requires Python 3 and the `libvirt-python` bindings (for example, the
+`python3-libvirt` package on Debian/Ubuntu).
 
 ```
 ~# make install

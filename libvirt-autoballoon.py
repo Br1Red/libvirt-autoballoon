@@ -8,7 +8,7 @@ import math
 import xml.etree.ElementTree as ET
 import libvirt
 
-from time import sleep, monotonic
+from time import monotonic
 
 SZ_1MiB = 1024
 SZ_256MiB = 256 * 1024
@@ -18,7 +18,7 @@ class ExitFailure(Exception):
     pass
 
 class LibVirtAutoBalloon:
-    sleep_time = 5
+    sleep_time = 2
     conn = None
     config = None
 
@@ -27,24 +27,36 @@ class LibVirtAutoBalloon:
         self.monitored_vms = set()
         self.memory_targets = {}
         self.manual_increase_until = {}
+        libvirt.virEventRegisterDefaultImpl()
         print("Connecting to libvirt at {}".format(qemu_addr), flush=True)
         self.conn = libvirt.open(qemu_addr)
         if self.conn is None:
             raise ExitFailure('Failed to open connection to the hypervisor')
-        self.__load_config()
-        self.dom_print_names()
+        try:
+            self.__load_config()
+        except (OSError, ValueError, KeyError, ExitFailure):
+            self.conn.close()
+            raise
 
     def __load_config(self):
         print("Loading config file: {}".format(self.configfile), flush=True)
-        content = open(self.configfile).read(-1)
-        self.config = json.loads(content, parse_int=int)
-        self.__validate_config_parameters()
+        with open(self.configfile) as configfile:
+            config = json.load(configfile, parse_int=int)
+        self.__validate_config_parameters(config)
+        self.config = config
 
-    def __validate_config_parameters(self):
-        configurations = [("default", self.config.get("default", {}))]
+    def __validate_config_parameters(self, config):
+        if (not isinstance(config, dict)
+                or not isinstance(config.get("default", {}), dict)
+                or not isinstance(config.get("vms"), list)
+                or any(not isinstance(vm, dict) for vm in config["vms"])):
+            raise ExitFailure(
+                "Invalid configuration: expected an object with a vms list of objects "
+                "and an optional default object")
+        configurations = [("default", config.get("default", {}))]
         configurations.extend(
             ("VM {}".format(vm.get("name", "<unnamed>")), vm)
-            for vm in self.config["vms"]
+            for vm in config["vms"]
         )
 
         for scope, parameters in configurations:
@@ -100,6 +112,7 @@ class LibVirtAutoBalloon:
               "MiB", sep='\t', flush=True)
 
     def status(self):
+        self.dom_print_names()
         domainIDs = self.conn.listDomainsID()
         if domainIDs is None:
             raise ExitFailure('No active domains')
@@ -168,38 +181,80 @@ class LibVirtAutoBalloon:
         self.monitored_vms = set()
         logging.debug("Found domains: %s", domainNames)
         for dom in domains:
-            name = dom.name()
-            if self.__vm_config_for_name(name).get("balloon", False) is not True:
-                print("Not monitoring {}: not selected for monitoring".format(name), flush=True)
-                continue
+            self.__refresh_domain(dom)
 
-            try:
-                domain_xml = ET.fromstring(dom.XMLDesc(0))
-            except (libvirt.libvirtError, ET.ParseError) as error:
-                print("Not monitoring {}: Cannot inspect balloon definition: {}".format(name, error), flush=True)
-                continue
+    def __forget_domain(self, name):
+        self.monitored_vms.discard(name)
+        self.memory_targets.pop(name, None)
+        self.manual_increase_until.pop(name, None)
 
-            balloon = domain_xml.find("./devices/memballoon")
-            stats = balloon.find("stats") if balloon is not None else None
-            raw_period = stats.get("period") if stats is not None else None
-            if raw_period is None:
-                print("Not monitoring {}: balloon stats period is missing".format(name), flush=True)
-                continue
-
-            try:
-                stats_period = int(raw_period)
-            except ValueError:
-                stats_period = None
-
-            if stats_period is None or not 0 < stats_period <= 5:
-                print("Not monitoring {}: invalid balloon stats period {!r}, expected 1 to 5".format(
-                    name, raw_period))
-                continue
-
+    def __refresh_domain(self, dom):
+        name = dom.name()
+        if self.__can_monitor_domain(dom):
             self.monitored_vms.add(name)
-            print("Monitoring {}".format(name), flush=True)
-            if balloon is None or balloon.get("autodeflate") != "on":
-                print("{}: autodeflate='on' is recommended, but is not set".format(name), flush=True)
+        else:
+            self.__forget_domain(name)
+
+    def __can_monitor_domain(self, dom):
+        name = dom.name()
+        if self.__vm_config_for_name(name).get("balloon", False) is not True:
+            print("Not monitoring {}: not selected for monitoring".format(name), flush=True)
+            return False
+
+        try:
+            domain_xml = ET.fromstring(dom.XMLDesc(0))
+        except (libvirt.libvirtError, ET.ParseError) as error:
+            print("Not monitoring {}: Cannot inspect balloon definition: {}".format(name, error), flush=True)
+            return False
+
+        balloon = domain_xml.find("./devices/memballoon")
+        stats = balloon.find("stats") if balloon is not None else None
+        raw_period = stats.get("period") if stats is not None else None
+        if raw_period is None:
+            print("Not monitoring {}: balloon stats period is missing".format(name), flush=True)
+            return False
+
+        try:
+            stats_period = int(raw_period)
+        except ValueError:
+            stats_period = None
+
+        if stats_period is None or not 0 < stats_period <= 5:
+            print("Not monitoring {}: invalid balloon stats period {!r}, expected 1 to 5".format(
+                name, raw_period), flush=True)
+            return False
+
+        print("Monitoring {}".format(name), flush=True)
+        if balloon.get("autodeflate") != "on":
+            print("{}: autodeflate='on' is recommended, but is not set".format(name), flush=True)
+        return True
+
+    def __domain_lifecycle(self, conn, dom, event, detail, opaque):
+        try:
+            if event in (libvirt.VIR_DOMAIN_EVENT_STOPPED, libvirt.VIR_DOMAIN_EVENT_CRASHED):
+                self.__forget_domain(dom.name())
+            elif event == libvirt.VIR_DOMAIN_EVENT_STARTED:
+                try:
+                    self.__load_config()
+                except (OSError, ValueError, ExitFailure) as error:
+                    logging.error("Cannot reload configuration %s; keeping previous configuration: %s",
+                                  self.configfile, error)
+                    self.__refresh_domain(dom)
+                else:
+                    self.dom_print_names()
+            elif event in (libvirt.VIR_DOMAIN_EVENT_DEFINED,
+                           libvirt.VIR_DOMAIN_EVENT_RESUMED):
+                self.__refresh_domain(dom)
+            elif event == libvirt.VIR_DOMAIN_EVENT_UNDEFINED:
+                if dom.ID() >= 0:
+                    self.__refresh_domain(dom)
+                else:
+                    self.__forget_domain(dom.name())
+        except libvirt.libvirtError as error:
+            logging.warning("Cannot update domain monitoring after lifecycle event: %s", error)
+
+    def __poll_timeout(self, timer, opaque):
+        self.poll_due = True
 
     def dom_keep_usable(self, dom):
         name = dom.name()
@@ -210,29 +265,34 @@ class LibVirtAutoBalloon:
         return keep_usable
 
     def daemon(self):
-        self.sleep_time = 5
         print("Starting daemon", flush=True)
-
-        while True:
-            domainIDs = self.conn.listDomainsID()
-
-            if domainIDs is None:
-                print('No active domains', file=sys.stderr, flush=True)
-                if self.sleep_time < 10:
-                    self.sleep_time += 1
-            else:
-                if self.sleep_time > 5:
-                    self.sleep_time -= 1
-
-                for domainID in domainIDs:
-                    try:
-                        dom = self.conn.lookupByID(domainID)
-                        self.process_domainID(dom)
-                    except libvirt.libvirtError as error:
-                        print("{} stopped or unavailable, skipping: {}".format(domainID, error),
-                              file=sys.stderr, flush=True)
-
-            sleep(self.sleep_time)
+        callback_id = self.conn.domainEventRegisterAny(
+            None, libvirt.VIR_DOMAIN_EVENT_ID_LIFECYCLE, self.__domain_lifecycle, None)
+        timer_id = None
+        try:
+            self.dom_print_names()
+            self.poll_due = True
+            timer_id = libvirt.virEventAddTimeout(
+                self.sleep_time * 1000, self.__poll_timeout, None)
+            while True:
+                if self.poll_due:
+                    self.poll_due = False
+                    domainIDs = self.conn.listDomainsID()
+                    if domainIDs is None:
+                        raise ExitFailure('Cannot list active domains')
+                    for domainID in domainIDs:
+                        try:
+                            dom = self.conn.lookupByID(domainID)
+                            self.process_domainID(dom)
+                        except libvirt.libvirtError as error:
+                            print("{} stopped or unavailable, skipping: {}".format(domainID, error),
+                                  file=sys.stderr, flush=True)
+                if libvirt.virEventRunDefaultImpl() < 0:
+                    raise ExitFailure("Libvirt event loop failed")
+        finally:
+            if timer_id is not None:
+                libvirt.virEventRemoveTimeout(timer_id)
+            self.conn.domainEventDeregisterAny(callback_id)
 
 def dom_balloon(dom, restrict_to):
     name = dom.name()
@@ -272,10 +332,13 @@ def libvirt_autoballoon(argv):
 
     lv_ctrl = LibVirtAutoBalloon(configfile=args.config)
 
-    if args.action == "start":
-        lv_ctrl.daemon()
-    elif args.action == "status":
-        lv_ctrl.status()
+    try:
+        if args.action == "start":
+            lv_ctrl.daemon()
+        elif args.action == "status":
+            lv_ctrl.status()
+    finally:
+        lv_ctrl.conn.close()
 
 def main(argv):
     libvirt_autoballoon(argv)
