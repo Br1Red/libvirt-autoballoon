@@ -1,5 +1,7 @@
 import importlib.util
 import io
+import base64
+import json
 import sys
 import types
 import unittest
@@ -95,13 +97,46 @@ class BalloonAdjustmentTests(unittest.TestCase):
         self.assertEqual(domain.calls, [expected])
 
 
+class VirtioMemAdjustmentTests(unittest.TestCase):
+    def test_dom_virtio_mem_updates_live_device_request(self):
+        xml = (
+            "<domain><memory unit='KiB'>3145728</memory>"
+            "<currentMemory unit='KiB'>3145728</currentMemory><devices>"
+            "<memory model='virtio-mem'><target>"
+            "<size unit='KiB'>2097152</size><block unit='KiB'>262144</block>"
+            "<node>0</node><requested unit='KiB'>524288</requested>"
+            "<current unit='KiB'>524288</current>"
+            "</target></memory></devices></domain>")
+        domain = Mock()
+        domain.name.return_value = "guest-vmem"
+        domain.XMLDesc.return_value = xml
+        libvirt_mock = types.SimpleNamespace(
+            libvirtError=type("LibvirtError", (Exception,), {}),
+            VIR_DOMAIN_AFFECT_LIVE=1,
+        )
+
+        with patch.object(autoballoon, "libvirt", libvirt_mock):
+            requested = autoballoon.dom_virtio_mem(domain, 2097152, 1572864)
+
+        self.assertEqual(requested, 2097152)
+        domain.updateDeviceFlags.assert_called_once()
+        updated_xml, flags = domain.updateDeviceFlags.call_args.args
+        updated_device = autoballoon.ET.fromstring(updated_xml)
+        self.assertEqual(flags, libvirt_mock.VIR_DOMAIN_AFFECT_LIVE)
+        self.assertEqual(updated_device.findtext("./target/requested"), "1048576")
+        self.assertIsNone(updated_device.find("./target/current"))
+
+
 class AdaptiveControllerTests(unittest.TestCase):
     def setUp(self):
         self.controller = autoballoon.LibVirtAutoBalloon.__new__(autoballoon.LibVirtAutoBalloon)
         self.controller.config = {"default": {}, "vms": [
-            {"name": "guest-a", "balloon": True, "manual_increase_grace_seconds": 3600}
+            {"name": "guest-a", "auto_memory": True, "manual_increase_grace_seconds": 3600}
         ]}
         self.controller.monitored_vms = {"guest-a"}
+        self.controller.guest_agents = set()
+        self.controller.read_only_vms = set()
+        self.controller.vm_backends = {"guest-a": {"type": "balloon"}}
         self.controller.stats_periods = {"guest-a": 2}
         self.controller.poll_interval = 2
         self.controller.memory_targets = {}
@@ -138,9 +173,37 @@ class AdaptiveControllerTests(unittest.TestCase):
                 with patch.object(self.controller, "dom_print_names"), redirect_stdout(output):
                     self.controller.status()
                 self.assertEqual([line.split() for line in output.getvalue().splitlines()], [
-                    ["Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Weight", "Units"],
-                    ["guest-a", "8192", "1024", "512", "512", "512", str(expected), "MiB"],
+                    ["Domain", "Stats_Source", "Memory_Method", "Total", "Actual", "Used",
+                     "Usable", "Keep_Usable", "Weight", "Units"],
+                    ["guest-a", "balloon", "balloon", "8192", "1024", "512", "512", "512",
+                     str(expected), "MiB"],
                 ])
+
+    def test_status_shows_statistics_source_and_memory_method(self):
+        self.controller.conn = Mock()
+        self.controller.conn.listDomainsID.return_value = [1]
+        self.controller.conn.lookupByID.return_value = self.domain
+
+        for backend, read_only, stats_source, expected_method in (
+                ("balloon", False, "balloon", "balloon"),
+                ("virtio-mem", False, "guest-agent", "virtio-mem"),
+                ("balloon", True, "guest-agent", "read-only")):
+            with self.subTest(backend=backend, read_only=read_only):
+                self.controller.vm_backends["guest-a"] = {"type": backend}
+                if read_only:
+                    self.controller.read_only_vms.add("guest-a")
+                else:
+                    self.controller.read_only_vms.discard("guest-a")
+                with patch.object(self.controller, "_get_domain_memstats", return_value={
+                        "actual": self.domain.memory,
+                        "usable": self.domain.usable,
+                        "source": stats_source}):
+                    output = io.StringIO()
+                    with patch.object(self.controller, "dom_print_names"), redirect_stdout(output):
+                        self.controller.status()
+
+                row = output.getvalue().splitlines()[1].split()
+                self.assertEqual(row[1:3], [stats_source, expected_method])
 
     def test_status_aligns_columns_for_long_names_and_large_numbers(self):
         long_domain = Domain("Windows11Professional-Lavoro")
@@ -169,8 +232,198 @@ class AdaptiveControllerTests(unittest.TestCase):
             self.controller.status()
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertEqual(output.getvalue().split(), [
-            "Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Weight", "Units",
+            "Domain", "Stats_Source", "Memory_Method", "Total", "Actual", "Used",
+            "Usable", "Keep_Usable", "Weight", "Units",
         ])
+
+    def test_guest_agent_meminfo_reads_and_closes_guest_file(self):
+        meminfo = "MemTotal: 1048576 kB\nMemAvailable: 524288 kB\n"
+        response = json.dumps({
+            "return": {
+                "buf-b64": base64.b64encode(meminfo.encode()).decode(),
+                "eof": True,
+            },
+        })
+        commands = []
+
+        def qemu_agent_command(domain, command, timeout, flags):
+            parsed = json.loads(command)
+            commands.append(parsed["execute"])
+            if parsed["execute"] == "guest-file-open":
+                return '{"return": 7}'
+            if parsed["execute"] == "guest-file-read":
+                return response
+            return '{"return": {}}'
+
+        qemu_module = types.SimpleNamespace(qemuAgentCommand=qemu_agent_command)
+        with patch.dict(sys.modules, {"libvirt_qemu": qemu_module}):
+            stats = self.controller._get_guest_agent_meminfo(self.domain)
+
+        self.assertEqual(stats, {
+            "actual": 1048576,
+            "usable": 524288,
+            "last_update": 100,
+            "source": "guest-agent",
+        })
+        self.assertEqual(commands, ["guest-file-open", "guest-file-read", "guest-file-close"])
+
+    def test_guest_agent_stats_fallback_drives_memory_growth(self):
+        self.controller.guest_agents.add("guest-a")
+        self.domain.usable = 100000
+        balloon_stats = {
+            "actual": self.domain.memory,
+            "usable": -1,
+            "last_update": self.now,
+        }
+        guest_stats = {
+            "actual": self.domain.memory,
+            "usable": self.domain.usable,
+            "last_update": self.now,
+            "source": "guest-agent",
+        }
+        with patch.object(self.domain, "memoryStats", return_value=balloon_stats):
+            with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats):
+                self.controller.process_domainID(self.domain, 0)
+
+        self.assertGreater(self.domain.memory, 1048576)
+
+    def test_virtio_mem_backend_uses_virtio_adjustments_not_balloon(self):
+        self.controller.vm_backends["guest-a"] = {"type": "virtio-mem"}
+        self.domain.usable = 100000
+        stats = {
+            "actual": self.domain.memory,
+            "usable": self.domain.usable,
+            "last_update": self.now,
+        }
+        vmem_info = {"max_ram_kb": self.domain.maximum, "base_ram_kb": 262144}
+        with patch.object(self.controller, "_inspect_virtio_mem_devices", return_value=vmem_info):
+            with patch.object(autoballoon, "dom_virtio_mem", return_value=2097152) as adjust_vmem:
+                with patch.object(autoballoon, "dom_balloon") as adjust_balloon:
+                    self.controller.process_domainID(self.domain, 0, stats)
+
+        adjust_vmem.assert_called_once()
+        args = adjust_vmem.call_args.args
+        self.assertIs(args[0], self.domain)
+        self.assertEqual(args[2], self.domain.memory)
+        self.assertGreater(args[1], self.domain.memory)
+        adjust_balloon.assert_not_called()
+        self.assertEqual(self.controller.pending_targets["guest-a"][0], 2097152)
+
+    def test_virtio_mem_reclaim_is_limited_by_host_pressure(self):
+        self.controller.vm_backends["guest-a"] = {"type": "virtio-mem"}
+        self.controller.conn = Mock()
+        self.controller.conn.listDomainsID.return_value = [1]
+        self.controller.conn.lookupByID.return_value = self.domain
+        self.domain.memory = 4194304
+        self.domain.usable = 3145728
+        vmem_info = {"max_ram_kb": self.domain.maximum, "base_ram_kb": 1048576}
+        requested_targets = []
+
+        def request_virtio_mem(domain, target, actual):
+            requested_targets.append(target)
+            return target if target != actual else None
+
+        for pressure in (0, 0.5, 1):
+            with self.subTest(pressure=pressure):
+                self.controller.memory_targets.clear()
+                self.controller.pending_targets.clear()
+                self.controller.control_samples.clear()
+                with patch.object(self.controller, "_get_domain_memstats", return_value={
+                        "actual": self.domain.memory,
+                        "usable": self.domain.usable,
+                        "last_update": self.now}):
+                    with patch.object(self.controller, "host_memory_pressure", return_value=pressure):
+                        with patch.object(
+                                self.controller, "_inspect_virtio_mem_devices", return_value=vmem_info):
+                            with patch.object(
+                                    autoballoon, "dom_virtio_mem", side_effect=request_virtio_mem):
+                                self.controller.process_domains()
+
+        self.assertEqual(requested_targets[0], self.domain.memory)
+        self.assertGreater(requested_targets[1], requested_targets[2])
+        self.assertLess(requested_targets[2], self.domain.memory)
+
+    def test_virtio_mem_statistics_use_current_device_memory(self):
+        self.controller.vm_backends["guest-a"] = {
+            "type": "virtio-mem",
+            "has_guest_agent": True,
+        }
+        self.domain.XMLDesc = Mock(return_value=(
+            "<domain><memory unit='KiB'>3145728</memory>"
+            "<currentMemory unit='KiB'>3145728</currentMemory><devices>"
+            "<memory model='virtio-mem'><target>"
+            "<size unit='KiB'>2097152</size><block unit='KiB'>262144</block>"
+            "<requested unit='KiB'>524288</requested><current unit='KiB'>524288</current>"
+            "</target></memory></devices></domain>"))
+        guest_stats = {
+            "actual": 3145728,
+            "usable": 2097152,
+            "last_update": self.now,
+            "source": "guest-agent",
+        }
+        with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats):
+            with patch.object(self.domain, "memoryStats", return_value={
+                    "actual": 0, "usable": -1, "last_update": 0}):
+                stats = self.controller._get_domain_memstats(self.domain)
+
+        self.assertEqual(stats["actual"], 1572864)
+        self.assertEqual(stats["usable"], 1572864)
+        self.assertEqual(stats["source"], "guest-agent")
+
+    def test_read_only_guest_agent_monitoring_does_not_change_memory(self):
+        self.controller.read_only_vms.add("guest-a")
+        guest_stats = {
+            "actual": self.domain.memory,
+            "usable": self.domain.usable,
+            "last_update": self.now,
+            "source": "guest-agent",
+        }
+
+        with patch.object(self.domain, "info") as info:
+            self.controller.process_domainID(self.domain, 1, guest_stats)
+
+        info.assert_not_called()
+        self.assertEqual(self.domain.calls, [])
+
+    def test_read_only_guest_agent_reads_stats_without_balloon_api(self):
+        self.controller.read_only_vms.add("guest-a")
+        guest_stats = {
+            "actual": self.domain.memory,
+            "usable": self.domain.usable,
+            "last_update": self.now,
+            "source": "guest-agent",
+        }
+
+        with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats) as get_stats:
+            with patch.object(self.domain, "memoryStats") as memory_stats:
+                stats = self.controller._get_domain_memstats(self.domain)
+
+        self.assertEqual(stats, guest_stats)
+        get_stats.assert_called_once_with(self.domain)
+        memory_stats.assert_not_called()
+
+    def test_fresh_balloon_stats_do_not_query_guest_agent(self):
+        self.controller.guest_agents.add("guest-a")
+        with patch.object(self.controller, "_get_guest_agent_meminfo") as get_guest_stats:
+            stats = self.controller._get_domain_memstats(self.domain)
+
+        self.assertEqual(stats["source"], "balloon")
+        get_guest_stats.assert_not_called()
+
+    def test_stale_balloon_stats_fall_back_to_guest_agent(self):
+        self.controller.guest_agents.add("guest-a")
+        self.domain.updated = self.now - 16
+        guest_stats = {
+            "actual": self.domain.memory,
+            "usable": self.domain.usable,
+            "last_update": self.now,
+            "source": "guest-agent",
+        }
+        with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats) as get_guest_stats:
+            stats = self.controller._get_domain_memstats(self.domain)
+
+        self.assertEqual(stats["source"], "guest-agent")
+        get_guest_stats.assert_called_once_with(self.domain)
 
     def test_no_change_at_reserve(self):
         self.domain.memory = 1310720
@@ -731,7 +984,7 @@ class AdaptiveControllerTests(unittest.TestCase):
                         self.controller._LibVirtAutoBalloon__validate_config_parameters(config)
 
     def test_general_rejects_vm_and_unknown_settings(self):
-        for parameters in ({"keep_free_kb": 524288}, {"balloon": True},
+        for parameters in ({"keep_free_kb": 524288}, {"auto_memory": True},
                            {"memory_weight": 100}, {"psi_threshol": 5}):
             with self.subTest(parameters=parameters):
                 config = {"general": parameters, "vms": []}
@@ -768,13 +1021,14 @@ class LifecycleTests(unittest.TestCase):
         libvirt_patch = patch.object(autoballoon, "libvirt", self.libvirt)
         libvirt_patch.start()
         self.addCleanup(libvirt_patch.stop)
-        self.config_open = mock_open(read_data='{"default": {"balloon": true}, "vms": []}')
+        self.config_open = mock_open(read_data='{"default": {"auto_memory": true}, "vms": []}')
         config_patch = patch("builtins.open", self.config_open)
         config_patch.start()
         self.addCleanup(config_patch.stop)
         self.controller = autoballoon.LibVirtAutoBalloon()
         self.domain = Mock()
         self.domain.name.return_value = "guest-new"
+        self.domain.isActive.return_value = 1
         self.domain.XMLDesc.return_value = (
             "<domain><devices><memballoon autodeflate='on'>"
             "<stats period='2'/></memballoon></devices></domain>")
@@ -790,8 +1044,8 @@ class LifecycleTests(unittest.TestCase):
         excluded = Mock()
         excluded.name.return_value = "excluded"
         self.config_open.return_value.read.return_value = (
-            '{"default": {"balloon": true}, '
-            '"vms": [{"name": "excluded", "balloon": false}]}')
+            '{"default": {"auto_memory": true}, '
+            '"vms": [{"name": "excluded", "auto_memory": false}]}')
         self.conn.listAllDomains.return_value = [self.domain, excluded]
         self.conn.listDomainsID.return_value = [1]
         self.conn.lookupByID.return_value = self.domain
@@ -824,10 +1078,10 @@ class LifecycleTests(unittest.TestCase):
                 self.controller.monitored_vms.clear()
                 self.lifecycle(event)
                 self.assertIn("guest-new", self.controller.monitored_vms)
-        self.controller.config["default"]["balloon"] = False
+        self.controller.config["default"]["auto_memory"] = False
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
         self.assertNotIn("guest-new", self.controller.monitored_vms)
-        self.controller.config["default"]["balloon"] = True
+        self.controller.config["default"]["auto_memory"] = True
         for xml in ("<domain/>", "<domain>",
                     "<domain><devices><memballoon><stats period='6'/>"
                     "</memballoon></devices></domain>"):
@@ -835,6 +1089,102 @@ class LifecycleTests(unittest.TestCase):
                 self.domain.XMLDesc.return_value = xml
                 self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
                 self.assertNotIn("guest-new", self.controller.monitored_vms)
+
+    def test_guest_agent_allows_monitoring_without_valid_balloon_stats_period(self):
+        self.domain.XMLDesc.return_value = (
+            "<domain><devices>"
+            "<channel type='unix'><target name='org.qemu.guest_agent.0'/></channel>"
+            "<memballoon autodeflate='on'/>"
+            "</devices></domain>")
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
+
+        self.assertIn("balloon stats period is missing", logs.output[0])
+        self.assertIn("guest-new", self.controller.monitored_vms)
+        self.assertIn("guest-new", self.controller.guest_agents)
+        self.assertEqual(self.controller.stats_periods["guest-new"], 5)
+
+    def test_spice_channel_without_balloon_requires_guest_agent_and_is_read_only(self):
+        spice_channel = (
+            "<channel type='spicevmc'><target type='virtio' name='com.redhat.spice.0'/>"
+            "</channel>")
+        guest_agent_channel = (
+            "<channel type='unix'><target name='org.qemu.guest_agent.0'/></channel>")
+        self.domain.XMLDesc.return_value = "<domain><devices>{}</devices></domain>".format(
+            spice_channel)
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
+        self.assertNotIn("guest-new", self.controller.monitored_vms)
+
+        self.domain.XMLDesc.return_value = "<domain><devices>{}{}</devices></domain>".format(
+            spice_channel, guest_agent_channel)
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
+
+        self.assertIn("guest-new", self.controller.monitored_vms)
+        self.assertIn("guest-new", self.controller.guest_agents)
+        self.assertIn("guest-new", self.controller.read_only_vms)
+        self.assertEqual(self.controller.stats_periods["guest-new"], 5)
+
+    def test_virtio_mem_without_balloon_is_monitored_with_guest_agent(self):
+        self.domain.XMLDesc.return_value = (
+            "<domain><memory unit='KiB'>3145728</memory>"
+            "<currentMemory unit='KiB'>3145728</currentMemory><devices>"
+            "<memory model='virtio-mem'><target><size unit='KiB'>2097152</size>"
+            "<block unit='KiB'>2048</block><requested unit='KiB'>524288</requested>"
+            "<current unit='KiB'>524288</current></target></memory>"
+            "<channel type='unix'><target name='org.qemu.guest_agent.0'/></channel>"
+            "</devices></domain>")
+
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
+
+        self.assertIn("guest-new", self.controller.monitored_vms)
+        self.assertIn("guest-new", self.controller.guest_agents)
+        self.assertNotIn("guest-new", self.controller.read_only_vms)
+        self.assertEqual(self.controller.vm_backends["guest-new"]["type"], "virtio-mem")
+        self.assertEqual(self.controller.vm_backends["guest-new"]["device_count"], 1)
+        self.assertEqual(self.controller.stats_periods["guest-new"], 5)
+        vmem_info = self.controller._inspect_virtio_mem_devices(self.domain)
+        self.assertEqual(vmem_info["base_ram_kb"], 1048576)
+        self.assertEqual(vmem_info["total_current_kb"], 524288)
+
+        self.domain.XMLDesc.return_value = self.domain.XMLDesc.return_value.replace(
+            "<channel type='unix'><target name='org.qemu.guest_agent.0'/></channel>", "")
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
+        self.assertNotIn("guest-new", self.controller.monitored_vms)
+
+    def test_virtio_mem_ignores_stats_period_when_balloon_model_is_none(self):
+        self.domain.XMLDesc.return_value = (
+            "<domain><memory unit='KiB'>3145728</memory>"
+            "<currentMemory unit='KiB'>3145728</currentMemory><devices>"
+            "<memballoon model='none'><stats period='1'/></memballoon>"
+            "<memory model='virtio-mem'><target><size unit='KiB'>2097152</size>"
+            "<block unit='KiB'>2048</block><requested unit='KiB'>524288</requested>"
+            "<current unit='KiB'>524288</current></target></memory>"
+            "<channel type='unix'><target name='org.qemu.guest_agent.0'/></channel>"
+            "</devices></domain>")
+
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
+
+        self.assertIn("guest-new", self.controller.monitored_vms)
+        self.assertEqual(self.controller.stats_periods["guest-new"], 5)
+
+    def test_poll_interval_ignores_inactive_domains(self):
+        inactive = Mock()
+        inactive.name.return_value = "guest-inactive"
+        inactive.isActive.return_value = 0
+        inactive.XMLDesc.return_value = (
+            "<domain><devices><memballoon><stats period='1'/>"
+            "</memballoon></devices></domain>")
+        self.domain.XMLDesc.return_value = (
+            "<domain><devices><memballoon><stats period='4'/>"
+            "</memballoon></devices></domain>")
+        self.conn.listAllDomains.return_value = [inactive, self.domain]
+
+        self.controller.dom_print_names()
+
+        self.assertEqual(self.controller.monitored_vms, {"guest-inactive", "guest-new"})
+        self.assertEqual(self.controller.stats_periods, {"guest-new": 4})
+        self.assertEqual(self.controller.poll_interval, 4)
 
     def test_stopped_crashed_and_removed_domains_clear_tracking(self):
         self.domain.ID.return_value = -1
@@ -874,8 +1224,8 @@ class LifecycleTests(unittest.TestCase):
         self.controller.manual_increase_until["guest-existing"] = 3600
         self.controller.control_samples["guest-existing"] = autoballoon.MemorySample(1, 1, 1, 100)
         self.config_open.return_value.read.return_value = (
-            '{"default": {"balloon": false}, "vms": ['
-            '{"name": "guest-new", "balloon": true, "keep_free_kb": 786432}]}')
+            '{"default": {"auto_memory": false}, "vms": ['
+            '{"name": "guest-new", "auto_memory": true, "keep_free_kb": 786432}]}')
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
         self.assertEqual(self.controller.monitored_vms, {"guest-new"})
         self.assertEqual(self.controller.dom_keep_usable(self.domain), 786432)
@@ -884,7 +1234,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.controller.control_samples, {})
 
         self.config_open.return_value.read.return_value = (
-            '{"default": {"balloon": false}, "vms": []}')
+            '{"default": {"auto_memory": false}, "vms": []}')
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
         self.assertEqual(self.controller.monitored_vms, set())
 
@@ -929,7 +1279,7 @@ class LifecycleTests(unittest.TestCase):
 
             info.reset_mock()
             self.config_open.return_value.read.return_value = (
-                '{"default": {"balloon": false}, "vms": []}')
+                '{"default": {"auto_memory": false}, "vms": []}')
             self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
             info.assert_any_call("Stopped monitoring %s", "guest-new")
             info.reset_mock()
@@ -939,7 +1289,7 @@ class LifecycleTests(unittest.TestCase):
 
             info.reset_mock()
             self.config_open.return_value.read.return_value = (
-                '{"default": {"balloon": true}, "vms": []}')
+                '{"default": {"auto_memory": true}, "vms": []}')
             self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
             info.assert_any_call("Monitoring %s", "guest-new")
             info.reset_mock()
@@ -1010,7 +1360,7 @@ class LifecycleTests(unittest.TestCase):
         excluded.XMLDesc.return_value = (
             "<domain><devices><memballoon><stats period='1'/>"
             "</memballoon></devices></domain>")
-        self.controller.config["vms"] = [{"name": "guest-excluded", "balloon": False}]
+        self.controller.config["vms"] = [{"name": "guest-excluded", "auto_memory": False}]
         self.domain.XMLDesc.return_value = (
             "<domain><devices><memballoon><stats period='5'/>"
             "</memballoon></devices></domain>")
@@ -1032,7 +1382,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.controller.poll_interval, 1)
         self.controller.timer_id = 7
         self.config_open.return_value.read.return_value = (
-            '{"default": {"balloon": false}, "vms": []}')
+            '{"default": {"auto_memory": false}, "vms": []}')
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
         self.assertEqual(self.controller.monitored_vms, set())
         self.assertEqual(self.controller.stats_periods, {})
@@ -1089,6 +1439,25 @@ class LifecycleTests(unittest.TestCase):
         self.libvirt.virEventUpdateTimeout.assert_not_called()
         self.libvirt.virEventRemoveTimeout.assert_called_once_with(7)
         self.assertIsNone(self.controller.timer_id)
+
+    def test_daemon_registers_and_removes_virtio_mem_callback_when_supported(self):
+        self.libvirt.VIR_DOMAIN_EVENT_ID_MEMORY_DEVICE_SIZE_CHANGE = 9
+        self.conn.domainEventRegisterAny.side_effect = [3, 4]
+        self.libvirt.virEventRunDefaultImpl.side_effect = KeyboardInterrupt
+        self.controller.process_domains = Mock()
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.controller.daemon()
+
+        registrations = self.conn.domainEventRegisterAny.call_args_list
+        self.assertEqual(registrations[0].args[1], self.libvirt.VIR_DOMAIN_EVENT_ID_LIFECYCLE)
+        self.assertEqual(
+            registrations[1].args[1],
+            self.libvirt.VIR_DOMAIN_EVENT_ID_MEMORY_DEVICE_SIZE_CHANGE)
+        self.assertEqual(
+            self.conn.domainEventDeregisterAny.call_args_list[0].args, (3,))
+        self.assertEqual(
+            self.conn.domainEventDeregisterAny.call_args_list[1].args, (4,))
 
     def test_event_loop_failure_is_reported_and_registrations_are_removed(self):
         self.conn.domainEventRegisterAny.return_value = 3

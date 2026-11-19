@@ -1,13 +1,15 @@
 # libvirt-autoballoon
 
 Daemon that reclaims unused memory from libvirt QEMU guests by adjusting their
-balloon devices. An adaptive EWMA/PD controller balances guest reserves against
-host memory pressure, with slow reclaim and rapid guest memory growth.
+balloon or virtio-mem devices. An adaptive EWMA/PD controller balances guest
+reserves against host memory pressure, with slow reclaim and rapid guest memory
+growth.
 
 ## VM Requirements
 
-A VM is monitored only when its effective configuration has `balloon: true`
-and its libvirt XML defines a balloon stats period from 1 to 5 seconds:
+A VM is monitored only when its effective configuration has `auto_memory: true`
+and its libvirt XML defines a balloon device or at least one virtio-mem device.
+Normally the balloon device must define a stats period from 1 to 5 seconds:
 
 ```
 <devices>
@@ -17,17 +19,42 @@ and its libvirt XML defines a balloon stats period from 1 to 5 seconds:
 </devices>
 ```
 
-The `stats` element and its `period` attribute are required for monitoring. A
-missing, non-numeric, zero, or greater-than-5 period produces a warning and the
-VM is not monitored. `autodeflate='on'` is recommended, but optional; its
-absence produces a warning only.
+If balloon statistics are missing, invalid, or stale, the daemon can instead
+read `MemTotal` and `MemAvailable` from the guest's `/proc/meminfo` through
+QEMU Guest Agent. For this fallback, the XML must define the
+`org.qemu.guest_agent.0` Unix channel and the agent must be running and
+reachable. It retains the balloon's current allocation when available and
+limits guest available memory to that allocation. When no valid balloon stats
+period is configured, the daemon polls at the default 5-second interval.
+Without a usable guest agent, a missing, non-numeric, zero, or greater-than-5
+period produces a warning and the VM is not monitored. `autodeflate='on'` is
+recommended, but optional; its absence produces a warning only.
+The daemon also warns when a balloon device has no `stats period` even if
+QEMU Guest Agent is available as a statistics fallback.
+
+A VM without a balloon device is also monitored when its XML defines both a
+SPICE channel (`type='spicevmc'`) and the QEMU Guest Agent channel above. In
+this case, the agent supplies memory statistics and the VM is monitored
+read-only: the daemon does not attempt to adjust its memory.
+
+When a VM has virtio-mem devices but no balloon device, the QEMU Guest Agent
+channel is required to provide guest memory statistics. The daemon then adjusts
+memory by updating the virtio-mem device requests live; no SPICE channel is
+required. If both balloon and virtio-mem devices are configured, virtio-mem is
+used for adjustments. For multiple virtio-mem devices, the target is distributed
+across the devices in proportion to their configured sizes and aligned to each
+device's memory block size. The fixed RAM portion is never reduced.
 
 The daemon uses `libvirt-python` with one persistent connection to
 `qemu:///system`. The polling interval is the minimum XML stats period among
-monitored VMs, using libvirt's event loop. Discovery, definition changes, and
-removal of VMs recalculate the interval and update the running timer without
-restarting the daemon. With no monitored VMs, the interval is 5 seconds.
-Each VM is controlled only when its own statistics have updated.
+active monitored VMs, using libvirt's event loop. Inactive VMs do not affect
+the interval, and stats periods on a `<memballoon model='none'>` device are
+ignored. Discovery, definition changes, and removal of VMs recalculate the
+interval and update the running timer without restarting the daemon. With no
+active monitored VMs, the interval is 5 seconds.
+Each VM is controlled only when its own statistics have updated. Guest Agent
+statistics are refreshed on demand and used only when fresh balloon statistics
+are unavailable.
 
 After an initial inventory, libvirt lifecycle events discover newly defined
 or started VMs and recheck their monitoring requirements without restarting
@@ -52,8 +79,10 @@ libvirt-autoballoon --config /path/to/autoballoon.json start
 libvirt-autoballoon -c /path/to/autoballoon.json status
 ```
 
-`status` displays an aligned table of active monitored VMs, with memory values
-in MiB and the effective memory weight. Column widths adapt to domain names and
+`status` displays an aligned table of active monitored VMs, including the
+statistics source (`balloon`, `guest-agent`, or `unavailable`) and the memory
+method (`balloon`, `virtio-mem`, or `read-only`), as well as memory values in
+MiB and the effective memory weight. Column widths adapt to domain names and
 values. Connection, configuration-loading, and monitoring messages are hidden
 by default; warnings and errors remain visible. Use `--debug status` to include
 diagnostic messages on stderr. The `start` command retains informational logs.
@@ -61,7 +90,7 @@ Informational messages have no level prefix; other log levels retain their
 prefixes (`DEBUG`, `WARNING`, `ERROR`).
 
 The `default` section supplies values for every VM. A VM entry overrides those
-values. If `balloon` is omitted from both places, it defaults to `false`.
+values. If `auto_memory` is omitted from both places, it defaults to `false`.
 
 ```json
 {
@@ -70,7 +99,7 @@ values. If `balloon` is omitted from both places, it defaults to `false`.
 		"host_min_free_ratio": 0.2
 	},
 	"default": {
-		"balloon": true,
+		"auto_memory": true,
 		"memory_weight": 100,
 		"keep_free_kb": 524288,
 		"keep_free_ratio": 0.1,
@@ -81,7 +110,7 @@ values. If `balloon` is omitted from both places, it defaults to `false`.
 		"manual_increase_grace_seconds": 600
 	},
 	"vms": [
-		{"name": "guest-a", "balloon": false},
+		{"name": "guest-a", "auto_memory": false},
 		{"name": "guest-b", "keep_free_kb": 1048576, "memory_weight": 500}
 	]
 }
@@ -161,7 +190,7 @@ against host or guest OOM.
   the normal reclaim rate; weights below `50` do not increase the rate beyond
   the twofold cap, although they still affect processing order. Emergency
   growth remains independent of weight.
-- **`balloon`** can be set to `false` for workloads that should not be managed
+- **`auto_memory`** can be set to `false` for workloads that should not be managed
   by this daemon. Their memory must still fit within the host's capacity.
 
 This illustrative configuration combines a balanced shared profile with a
@@ -176,7 +205,7 @@ measurements before deploying:
 		"host_min_free_ratio": 0.12
 	},
 	"default": {
-		"balloon": true,
+		"auto_memory": true,
 		"keep_free_kb": 524288,
 		"keep_free_ratio": 0.1,
 		"memory_weight": 100,

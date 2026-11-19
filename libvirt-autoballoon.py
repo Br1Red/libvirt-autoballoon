@@ -2,6 +2,7 @@
 
 import sys
 import json
+import base64
 import argparse
 import logging
 import math
@@ -16,6 +17,30 @@ SZ_4KiB = 4
 SZ_1MiB = 1024
 SZ_256MiB = 256 * 1024
 SZ_512MiB = 512 * 1024
+
+UNIT_MULTIPLIERS = {
+    "b": 1 / 1024.0,
+    "bytes": 1 / 1024.0,
+    "k": 1,
+    "kb": 1000 / 1024.0,
+    "kib": 1,
+    "m": 1024,
+    "mb": (1000 ** 2) / 1024.0,
+    "mib": 1024,
+    "g": 1024 ** 2,
+    "gb": (1000 ** 3) / 1024.0,
+    "gib": 1024 ** 2,
+    "t": 1024 ** 3,
+    "tb": (1000 ** 4) / 1024.0,
+    "tib": 1024 ** 3,
+}
+
+def parse_xml_size_kb(element, default=0):
+    if element is None or element.text is None:
+        return default
+    raw_value = int(element.text.strip())
+    unit = element.get("unit", "KiB").strip().lower()
+    return int(raw_value * UNIT_MULTIPLIERS.get(unit, 1))
 
 class MemorySample(NamedTuple):
     used_ewma: float
@@ -40,6 +65,9 @@ class LibVirtAutoBalloon:
     def __init__(self, qemu_addr='qemu:///system', configfile='/etc/libvirt/autoballoon.json'):
         self.configfile = configfile
         self.monitored_vms = set()
+        self.guest_agents = set()
+        self.read_only_vms = set()
+        self.vm_backends = {}
         self.stats_periods = {}
         self.timer_id = None
         self.memory_targets = {}
@@ -143,8 +171,147 @@ class LibVirtAutoBalloon:
                 return self.__vm_config(vm)
         return self.config.get("default", {})
 
+    def _get_guest_agent_meminfo(self, dom):
+        name = dom.name()
+        handle = None
+        try:
+            import libvirt_qemu
+            command = json.dumps({
+                "execute": "guest-file-open",
+                "arguments": {"path": "/proc/meminfo", "mode": "r"},
+            })
+            handle = json.loads(libvirt_qemu.qemuAgentCommand(dom, command, 1, 0))["return"]
+            chunks = []
+            while True:
+                command = json.dumps({
+                    "execute": "guest-file-read",
+                    "arguments": {"handle": handle, "count": 4096},
+                })
+                response = json.loads(libvirt_qemu.qemuAgentCommand(dom, command, 1, 0))
+                result = response.get("return", {})
+                encoded = result.get("buf-b64", "")
+                if encoded:
+                    chunks.append(base64.b64decode(encoded).decode("utf-8", errors="ignore"))
+                if result.get("eof", True) or not encoded:
+                    break
+            mem_total = 0
+            mem_available = -1
+            for line in "".join(chunks).splitlines():
+                fields = line.split()
+                if len(fields) >= 2:
+                    if fields[0] == "MemTotal:":
+                        mem_total = int(fields[1])
+                    elif fields[0] == "MemAvailable:":
+                        mem_available = int(fields[1])
+            if mem_total > 0 and mem_available >= 0:
+                return {
+                    "actual": mem_total,
+                    "usable": mem_available,
+                    "last_update": int(time()),
+                    "source": "guest-agent",
+                }
+        except (ImportError, libvirt.libvirtError, KeyError, ValueError) as error:
+            logging.debug("%s guest-agent meminfo failed: %s", name, error)
+        finally:
+            if handle is not None:
+                try:
+                    import libvirt_qemu
+                    command = json.dumps({
+                        "execute": "guest-file-close",
+                        "arguments": {"handle": handle},
+                    })
+                    libvirt_qemu.qemuAgentCommand(dom, command, 1, 0)
+                except (ImportError, libvirt.libvirtError) as error:
+                    logging.debug("%s guest-agent meminfo close failed: %s", name, error)
+        return None
+
+    def _get_domain_memstats(self, dom):
+        name = dom.name()
+        if name in self.read_only_vms:
+            return self._get_guest_agent_meminfo(dom) or {}
+        backend = self.vm_backends.get(name, {})
+        try:
+            memstat = dom.memoryStats()
+        except libvirt.libvirtError as error:
+            logging.debug("%s balloon memory stats failed: %s", name, error)
+            memstat = {}
+        actual = memstat.get("actual", 0)
+        if backend.get("type") == "virtio-mem":
+            vmem_info = self._inspect_virtio_mem_devices(dom)
+            if vmem_info is not None:
+                actual = vmem_info["base_ram_kb"] + vmem_info["total_current_kb"]
+        usable = memstat.get("usable", -1)
+        updated = memstat.get("last_update", 0)
+        if actual > 0 and 0 <= usable <= actual and updated > 0 and 0 <= time() - updated <= 15:
+            return {
+                "actual": actual,
+                "usable": usable,
+                "last_update": updated,
+                "source": "balloon",
+            }
+        if backend.get("has_guest_agent") or name in self.guest_agents:
+            guest_stats = self._get_guest_agent_meminfo(dom)
+            if guest_stats is not None:
+                effective_actual = actual if actual > 0 else guest_stats["actual"]
+                return {
+                    "actual": effective_actual,
+                    "usable": min(effective_actual, guest_stats["usable"]),
+                    "last_update": guest_stats["last_update"],
+                    "source": "guest-agent",
+                }
+        return memstat
+
+    def _inspect_virtio_mem_devices(self, dom):
+        try:
+            domain_xml = ET.fromstring(dom.XMLDesc(0))
+            vmem_nodes = domain_xml.findall("./devices/memory[@model='virtio-mem']")
+            if not vmem_nodes:
+                return None
+            total_domain_mem_kb = parse_xml_size_kb(domain_xml.find("./memory"), 0)
+            current_domain_mem_kb = parse_xml_size_kb(
+                domain_xml.find("./currentMemory"), total_domain_mem_kb)
+            devices = []
+            total_size_kb = 0
+            total_requested_kb = 0
+            total_current_kb = 0
+            for index, device in enumerate(vmem_nodes):
+                target = device.find("target")
+                if target is None:
+                    continue
+                size_kb = parse_xml_size_kb(target.find("size"), 0)
+                block_kb = parse_xml_size_kb(target.find("block"), 2048)
+                requested_kb = parse_xml_size_kb(target.find("requested"), 0)
+                current_kb = parse_xml_size_kb(target.find("current"), requested_kb)
+                node = target.find("node")
+                numa_node = int(node.text.strip()) if node is not None and node.text else 0
+                alias = device.find("alias")
+                devices.append({
+                    "index": index,
+                    "alias": alias.get("name") if alias is not None else "virtiomem{}".format(index),
+                    "node": numa_node,
+                    "size_kb": size_kb,
+                    "block_kb": max(SZ_4KiB, block_kb),
+                    "requested_kb": requested_kb,
+                    "current_kb": current_kb,
+                })
+                total_size_kb += size_kb
+                total_requested_kb += requested_kb
+                total_current_kb += current_kb
+            base_ram_kb = max(0, current_domain_mem_kb - total_size_kb)
+            return {
+                "devices": devices,
+                "base_ram_kb": base_ram_kb,
+                "max_ram_kb": base_ram_kb + total_size_kb,
+                "total_size_kb": total_size_kb,
+                "total_requested_kb": total_requested_kb,
+                "total_current_kb": total_current_kb,
+            }
+        except (libvirt.libvirtError, ET.ParseError, ValueError) as error:
+            logging.warning("%s cannot inspect virtio-mem configuration: %s", dom.name(), error)
+            return None
+
     def dom_status(self, dom):
-        memstat = dom.memoryStats()
+        memstat = self._get_domain_memstats(dom)
         actual = memstat.get("actual", 0)
         usable = memstat.get("usable", 0)
         used = actual - usable
@@ -152,8 +319,13 @@ class LibVirtAutoBalloon:
         keep_usable = self.dom_keep_usable(dom, actual)
         name = dom.name()
         memory_weight = self.__vm_config_for_name(name).get("memory_weight", 100)
+        backend = self.vm_backends.get(name, {"type": "balloon"})
+        stats_method = memstat.get("source", "unavailable")
+        memory_method = "read-only" if name in self.read_only_vms else backend["type"]
         return (
             name,
+            stats_method,
+            memory_method,
             str(int(total_ram / SZ_1MiB)),
             str(int(actual / SZ_1MiB)),
             str(int(used / SZ_1MiB)),
@@ -168,7 +340,10 @@ class LibVirtAutoBalloon:
         domainIDs = self.conn.listDomainsID()
         if domainIDs is None:
             raise ExitFailure('No active domains')
-        rows = [("Domain", "Total", "Actual", "Used", "Usable", "Keep_Usable", "Weight", "Units")]
+        rows = [(
+            "Domain", "Stats_Source", "Memory_Method", "Total", "Actual",
+            "Used", "Usable", "Keep_Usable", "Weight", "Units",
+        )]
         for domainID in domainIDs:
             dom = self.conn.lookupByID(domainID)
             if dom.name() in self.monitored_vms:
@@ -176,7 +351,7 @@ class LibVirtAutoBalloon:
         widths = [max(len(value) for value in column) for column in zip(*rows)]
         for row in rows:
             print("  ".join(
-                value.ljust(width) if index in (0, len(row) - 1) else value.rjust(width)
+                value.ljust(width) if index in (0, 1, 2, len(row) - 1) else value.rjust(width)
                 for index, (value, width) in enumerate(zip(row, widths))
             ).rstrip(), flush=True)
 
@@ -184,10 +359,11 @@ class LibVirtAutoBalloon:
         name = dom.name()
         if name not in self.monitored_vms:
             return
+        backend = self.vm_backends.get(name, {"type": "balloon"})
         parameters = self.__vm_config_for_name(name)
         grace = parameters.get("manual_increase_grace_seconds", 0)
         if memstat is None:
-            memstat = dom.memoryStats()
+            memstat = self._get_domain_memstats(dom)
         actual = memstat.get("actual", 0)
         usable = memstat.get("usable", -1)
         updated = memstat.get("last_update", 0)
@@ -199,7 +375,7 @@ class LibVirtAutoBalloon:
             and now - pending_request[1] >= 30
             and abs(actual - pending_request[0]) > SZ_4KiB)
         if pending_expired:
-            logging.warning("%s balloon target %s KiB timed out after 30 seconds; allowing retries",
+            logging.warning("%s memory target %s KiB timed out after 30 seconds; allowing retries",
                             name, pending_target)
             self.pending_targets.pop(name, None)
         if actual <= 0 or not 0 <= usable <= actual or updated <= 0:
@@ -213,7 +389,17 @@ class LibVirtAutoBalloon:
         if previous is not None and updated == previous.updated:
             logging.debug("%s memory stats have not updated, skipping", name)
             return
+        if name in self.read_only_vms:
+            logging.debug("%s is monitored read-only because it has no balloon device", name)
+            return
         info = dom.info()
+        max_allowed_ram = info[1]
+        min_allowed_ram = 0
+        if backend["type"] == "virtio-mem":
+            vmem_info = self._inspect_virtio_mem_devices(dom)
+            if vmem_info is not None:
+                max_allowed_ram = vmem_info["max_ram_kb"]
+                min_allowed_ram = vmem_info["base_ram_kb"]
         previous_memory = self.memory_targets.get(name)
         own_growth = pending_target is not None and actual <= pending_target + SZ_4KiB
         external_increase = (
@@ -261,8 +447,8 @@ class LibVirtAutoBalloon:
         elif delta > 0:
             delta = min(delta, actual * 0.5)
         min_reserve = self.dom_keep_usable(dom, 0)
-        floor = min(info[1], int(
-            min_reserve * 2 / max(0.1, 1 - parameters.get("keep_free_ratio", 0.1))))
+        pd_floor = int(min_reserve * 2 / max(0.1, 1 - parameters.get("keep_free_ratio", 0.1)))
+        floor = min(max_allowed_ram, max(min_allowed_ram, pd_floor))
         if delta < 0:
             if now < self.manual_increase_until.get(name, 0):
                 logging.debug("%s reduction postponed after an unattributed memory increase", name)
@@ -276,16 +462,20 @@ class LibVirtAutoBalloon:
                 * weight_multiplier)
             surplus = max(0, min(usable - reserve, -error))
             delta = -min(-delta, reclaim_limit, surplus)
-        target = min(info[1], max(floor, actual + int(delta)))
+        target = min(max_allowed_ram, max(floor, actual + int(delta)))
         if pending_target is not None and not (emergency and target > max(actual, pending_target)):
-            logging.debug("%s waiting for balloon target %s KiB; actual=%s KiB",
+            logging.debug("%s waiting for memory target %s KiB; actual=%s KiB",
                           name, pending_target, actual)
             return
         logging.debug(
-            "%s actual=%s usable=%s used_ewma=%.1f reserve=%.1f error=%.1f "
+            "%s [%s] actual=%s usable=%s used_ewma=%.1f reserve=%.1f error=%.1f "
             "derivative=%.1f used_rate=%.1f emergency=%s target=%s KiB",
-            name, actual, usable, used_ewma, reserve, error, derivative, used_rate, emergency, target)
-        requested = dom_balloon(dom, target, actual, info[1])
+            name, backend["type"], actual, usable, used_ewma, reserve, error,
+            derivative, used_rate, emergency, target)
+        if backend["type"] == "virtio-mem":
+            requested = dom_virtio_mem(dom, target, actual)
+        else:
+            requested = dom_balloon(dom, target, actual, max_allowed_ram)
         if requested is not None:
             self.pending_targets[name] = (requested, monotonic())
 
@@ -331,9 +521,9 @@ class LibVirtAutoBalloon:
                 name = dom.name()
                 if name not in self.monitored_vms:
                     continue
-                memstat = dom.memoryStats()
+                memstat = self._get_domain_memstats(dom)
                 actual = memstat.get("actual", 0)
-                idle_ratio = memstat.get("usable", 0) / actual if actual > 0 else 0
+                idle_ratio = max(0, memstat.get("usable", 0)) / actual if actual > 0 else 0
                 memory_weight = self.__vm_config_for_name(name).get("memory_weight", 100)
                 yield_score = idle_ratio / (memory_weight / 100.0)
                 domains.append((yield_score, dom, memstat))
@@ -369,6 +559,9 @@ class LibVirtAutoBalloon:
         if name in self.monitored_vms:
             logging.info("Stopped monitoring %s", name)
         self.monitored_vms.discard(name)
+        self.guest_agents.discard(name)
+        self.read_only_vms.discard(name)
+        self.vm_backends.pop(name, None)
         self.stats_periods.pop(name, None)
         self.memory_targets.pop(name, None)
         self.pending_targets.pop(name, None)
@@ -384,32 +577,92 @@ class LibVirtAutoBalloon:
         else:
             self.__forget_domain(name)
 
+    def __set_stats_period_if_active(self, dom, period):
+        name = dom.name()
+        try:
+            active = dom.isActive()
+        except libvirt.libvirtError as error:
+            logging.debug("%s cannot determine active state for polling interval: %s", name, error)
+            return
+        if active:
+            self.stats_periods[name] = period
+
     def __can_monitor_domain(self, dom):
         name = dom.name()
-        if self.__vm_config_for_name(name).get("balloon", False) is not True:
+        self.guest_agents.discard(name)
+        self.read_only_vms.discard(name)
+        self.stats_periods.pop(name, None)
+        if self.__vm_config_for_name(name).get("auto_memory", False) is not True:
             return False
         try:
             domain_xml = ET.fromstring(dom.XMLDesc(0))
         except (libvirt.libvirtError, ET.ParseError) as error:
             print("Not monitoring {}: Cannot inspect balloon definition: {}".format(name, error), flush=True)
             return False
+        has_guest_agent = domain_xml.find(
+            "./devices/channel[@type='unix']/target[@name='org.qemu.guest_agent.0']"
+        ) is not None
+        has_spice_channel = domain_xml.find("./devices/channel[@type='spicevmc']") is not None
+        vmem_devices = domain_xml.findall("./devices/memory[@model='virtio-mem']")
         balloon = domain_xml.find("./devices/memballoon")
-        stats = balloon.find("stats") if balloon is not None else None
+        balloon_enabled = balloon is not None and balloon.get("model") != "none"
+        stats = balloon.find("stats") if balloon_enabled else None
         raw_period = stats.get("period") if stats is not None else None
-        if raw_period is None:
-            print("Not monitoring {}: balloon stats period is missing".format(name), flush=True)
-            return False
         try:
-            stats_period = int(raw_period)
-        except ValueError:
+            stats_period = int(raw_period) if raw_period is not None else None
+        except (TypeError, ValueError):
             stats_period = None
-        if stats_period is None or not 0 < stats_period <= 5:
-            print("Not monitoring {}: invalid balloon stats period {!r}, expected 1 to 5".format(
-                name, raw_period), flush=True)
+        if stats_period is not None and not 0 < stats_period <= 5:
+            stats_period = None
+        if balloon is not None and balloon.get("model") != "none" and raw_period is None:
+            logging.warning("%s balloon stats period is missing", name)
+        if vmem_devices:
+            if stats_period is None and not has_guest_agent:
+                print(
+                    "Not monitoring {}: virtio-mem requires valid balloon stats or "
+                    "the QEMU Guest Agent".format(name),
+                    flush=True)
+                return False
+            self.vm_backends[name] = {
+                "type": "virtio-mem",
+                "device_count": len(vmem_devices),
+                "has_balloon_stats": stats_period is not None,
+                "has_guest_agent": has_guest_agent,
+            }
+            if has_guest_agent:
+                self.guest_agents.add(name)
+            self.__set_stats_period_if_active(dom, stats_period if stats_period is not None else 5)
+            return True
+        if not balloon_enabled:
+            if has_spice_channel and has_guest_agent:
+                self.guest_agents.add(name)
+                self.read_only_vms.add(name)
+                self.memory_targets.pop(name, None)
+                self.pending_targets.pop(name, None)
+                self.manual_increase_until.pop(name, None)
+                self.control_samples.pop(name, None)
+                self.__set_stats_period_if_active(dom, 5)
+                return True
+            print("Not monitoring {}: balloon device is missing or disabled".format(name), flush=True)
             return False
+        if stats_period is None or not 0 < stats_period <= 5:
+            if not has_guest_agent:
+                if raw_period is not None:
+                    print("Not monitoring {}: invalid balloon stats period {!r}, expected 1 to 5".format(
+                        name, raw_period), flush=True)
+                return False
+            stats_period = 5
         if balloon.get("autodeflate") != "on":
             print("{}: autodeflate='on' is recommended, but is not set".format(name), flush=True)
-        self.stats_periods[name] = stats_period
+        if has_guest_agent:
+            self.guest_agents.add(name)
+        self.vm_backends[name] = {
+            "type": "balloon",
+            "device_count": 1,
+            "has_balloon_stats": stats_period is not None,
+            "has_guest_agent": has_guest_agent,
+        }
+        self.__set_stats_period_if_active(dom, stats_period)
         return True
 
     def __domain_lifecycle(self, conn, dom, event, detail, opaque):
@@ -439,6 +692,17 @@ class LibVirtAutoBalloon:
         except libvirt.libvirtError as error:
             logging.warning("Cannot update domain monitoring after lifecycle event: %s", error)
 
+    def __memory_device_size_change(self, conn, dom, alias, size, opaque):
+        name = dom.name()
+        logging.debug("%s virtio-mem device %s changed size to %s KiB", name, alias, size)
+        vmem_info = self._inspect_virtio_mem_devices(dom)
+        if vmem_info is not None:
+            actual_total = vmem_info["base_ram_kb"] + vmem_info["total_current_kb"]
+            pending = self.pending_targets.get(name)
+            if pending is not None and abs(actual_total - pending[0]) <= SZ_4KiB:
+                self.memory_targets[name] = actual_total
+                self.pending_targets.pop(name, None)
+
     def __poll_timeout(self, timer, opaque):
         self.poll_due = True
 
@@ -454,7 +718,15 @@ class LibVirtAutoBalloon:
         print("Starting daemon", flush=True)
         callback_id = self.conn.domainEventRegisterAny(
             None, libvirt.VIR_DOMAIN_EVENT_ID_LIFECYCLE, self.__domain_lifecycle, None)
+        memdev_callback_id = None
         try:
+            if hasattr(libvirt, "VIR_DOMAIN_EVENT_ID_MEMORY_DEVICE_SIZE_CHANGE"):
+                memdev_callback_id = self.conn.domainEventRegisterAny(
+                    None,
+                    libvirt.VIR_DOMAIN_EVENT_ID_MEMORY_DEVICE_SIZE_CHANGE,
+                    self.__memory_device_size_change,
+                    None,
+                )
             self.dom_print_names()
             self.poll_due = True
             self.timer_id = libvirt.virEventAddTimeout(
@@ -470,6 +742,8 @@ class LibVirtAutoBalloon:
                 libvirt.virEventRemoveTimeout(self.timer_id)
                 self.timer_id = None
             self.conn.domainEventDeregisterAny(callback_id)
+            if memdev_callback_id is not None:
+                self.conn.domainEventDeregisterAny(memdev_callback_id)
 
 def dom_balloon(dom, restrict_to, actual, total_ram):
     name = dom.name()
@@ -484,15 +758,105 @@ def dom_balloon(dom, restrict_to, actual, total_ram):
     restrict_to_m = "{:.3f}".format(restrict_to / SZ_1MiB)
     diff_m = "{:.3f}".format(diff_kb / SZ_1MiB)
     if actual > restrict_to:
-        print("Shrink dom:",
+        print("Shrink dom (balloon):",
               name,
               actual_m, "-", diff_m, "=", restrict_to_m, "MiB", flush=True)
     else:
-        print("Grow dom:",
+        print("Grow dom (balloon):",
               name,
               actual_m, "+", diff_m, "=", restrict_to_m, "MiB", flush=True)
     dom.setMemory(restrict_to)
     return restrict_to
+
+def dom_virtio_mem(dom, target_total_kb, actual_total_kb):
+    name = dom.name()
+    try:
+        domain_xml = ET.fromstring(dom.XMLDesc(0))
+    except (libvirt.libvirtError, ET.ParseError) as error:
+        logging.error("%s cannot parse XML for virtio-mem update: %s", name, error)
+        return None
+    vmem_nodes = domain_xml.findall("./devices/memory[@model='virtio-mem']")
+    if not vmem_nodes:
+        return None
+    try:
+        current_domain_mem_kb = parse_xml_size_kb(
+            domain_xml.find("./currentMemory"), actual_total_kb)
+        devices = []
+        total_size_kb = 0
+        for device in vmem_nodes:
+            target = device.find("target")
+            if target is None:
+                continue
+            size_kb = parse_xml_size_kb(target.find("size"), 0)
+            block_kb = max(SZ_4KiB, parse_xml_size_kb(target.find("block"), 2048))
+            requested_kb = parse_xml_size_kb(target.find("requested"), 0)
+            current_kb = parse_xml_size_kb(target.find("current"), requested_kb)
+            node = target.find("node")
+            numa_node = int(node.text.strip()) if node is not None and node.text else 0
+            devices.append({
+                "xml": device,
+                "target": target,
+                "node": numa_node,
+                "size_kb": size_kb,
+                "block_kb": block_kb,
+                "requested_kb": requested_kb,
+                "current_kb": current_kb,
+            })
+            total_size_kb += size_kb
+    except (TypeError, ValueError) as error:
+        logging.error("%s cannot parse virtio-mem sizes: %s", name, error)
+        return None
+    if total_size_kb <= 0 or not devices:
+        return None
+    base_ram_kb = max(0, current_domain_mem_kb - total_size_kb)
+    desired_vmem_total = max(0, min(total_size_kb, int(target_total_kb) - base_ram_kb))
+    ratio = desired_vmem_total / float(total_size_kb)
+    updates = []
+    new_total_requested = 0
+    for device in devices:
+        raw_requested = int(device["size_kb"] * ratio)
+        aligned_requested = int(round(raw_requested / device["block_kb"])) * device["block_kb"]
+        aligned_requested = max(0, min(device["size_kb"], aligned_requested))
+        updates.append((device, aligned_requested))
+        new_total_requested += aligned_requested
+    new_total_ram = base_ram_kb + new_total_requested
+    difference = abs(actual_total_kb - new_total_ram)
+    min_block = min(device["block_kb"] for device in devices)
+    if difference < max(SZ_1MiB, min_block):
+        return None
+    changed = False
+    for device, requested_kb in updates:
+        if requested_kb == device["requested_kb"]:
+            continue
+        target = device["target"]
+        requested = target.find("requested")
+        if requested is None:
+            requested = ET.SubElement(target, "requested")
+        requested.set("unit", "KiB")
+        requested.text = str(requested_kb)
+        current = target.find("current")
+        if current is not None:
+            target.remove(current)
+        device_xml = ET.tostring(device["xml"], encoding="unicode")
+        try:
+            dom.updateDeviceFlags(device_xml, libvirt.VIR_DOMAIN_AFFECT_LIVE)
+            changed = True
+        except libvirt.libvirtError as error:
+            logging.error(
+                "%s failed updating virtio-mem on node %s to %s KiB: %s",
+                name, device["node"], requested_kb, error)
+    if not changed:
+        return None
+    actual_mib = "{:.3f}".format(actual_total_kb / SZ_1MiB)
+    target_mib = "{:.3f}".format(new_total_ram / SZ_1MiB)
+    difference_mib = "{:.3f}".format(difference / SZ_1MiB)
+    if actual_total_kb > new_total_ram:
+        print("Shrink dom (virtio-mem, {} dev): {} {} - {} = {} MiB".format(
+            len(devices), name, actual_mib, difference_mib, target_mib), flush=True)
+    else:
+        print("Grow dom (virtio-mem, {} dev): {} {} + {} = {} MiB".format(
+            len(devices), name, actual_mib, difference_mib, target_mib), flush=True)
+    return new_total_ram
 
 def handle_sigterm(signum, _frame):
     raise SystemExit(128 + signum)
