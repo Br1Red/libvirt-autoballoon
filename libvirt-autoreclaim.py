@@ -86,11 +86,12 @@ class LibVirtAutoReclaim:
             raise
 
     def __load_config(self):
-        logging.info("Loading config file: %s", self.configfile)
         with open(self.configfile) as configfile:
             config = json.load(configfile, parse_int=int)
         self.__validate_config_parameters(config)
         if self.config != config:
+            action = "Loading" if self.config is None else "Reloading"
+            logging.info("%s config file: %s", action, self.configfile)
             self.control_samples.clear()
         self.config = config
 
@@ -570,7 +571,12 @@ class LibVirtAutoReclaim:
 
     def __refresh_domain(self, dom):
         name = dom.name()
-        if self.__can_monitor_domain(dom):
+        try:
+            active = dom.isActive()
+        except libvirt.libvirtError as error:
+            logging.debug("%s cannot determine active state for monitoring: %s", name, error)
+            return
+        if active and self.__can_monitor_domain(dom):
             if name not in self.monitored_vms:
                 logging.info("Monitoring %s", name)
             self.monitored_vms.add(name)
@@ -861,7 +867,7 @@ def dom_virtio_mem(dom, target_total_kb, actual_total_kb):
 def handle_sigterm(signum, _frame):
     raise SystemExit(128 + signum)
 
-def report_status_libvirt_error(_context, error):
+def report_libvirt_error(_context, error):
     code, _, message, level = error[:4]
     if (code == libvirt.VIR_ERR_AGENT_UNRESPONSIVE
             or code == getattr(libvirt, "VIR_ERR_AGENT_COMMAND_TIMEOUT", None)):
@@ -886,19 +892,17 @@ def libvirt_autoreclaim(argv):
         handlers=[handler])
     previous_sigterm = signal.signal(signal.SIGTERM, handle_sigterm)
     try:
+        libvirt.registerErrorHandler(report_libvirt_error, None)
         lv_ctrl = LibVirtAutoReclaim(configfile=args.config)
         try:
             if args.action == "start":
                 lv_ctrl.daemon()
             elif args.action == "status":
-                libvirt.registerErrorHandler(report_status_libvirt_error, None)
-                try:
-                    lv_ctrl.status()
-                finally:
-                    libvirt.registerErrorHandler(None, None)
+                lv_ctrl.status()
         finally:
             lv_ctrl.conn.close()
     finally:
+        libvirt.registerErrorHandler(None, None)
         signal.signal(signal.SIGTERM, previous_sigterm)
 
 def main(argv):

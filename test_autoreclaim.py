@@ -1074,7 +1074,7 @@ class LifecycleTests(unittest.TestCase):
                 else:
                     self.assertEqual(errors.getvalue(), "")
 
-    def test_status_hides_agent_unavailability_but_keeps_other_libvirt_errors(self):
+    def test_cli_hides_agent_unavailability_but_keeps_other_libvirt_errors(self):
         self.domain.XMLDesc.return_value = (
             "<domain><devices>"
             "<channel type='spicevmc'/>"
@@ -1097,23 +1097,28 @@ class LifecycleTests(unittest.TestCase):
 
         qemu_module = types.SimpleNamespace(qemuAgentCommand=qemu_agent_command)
         for agent_code in (86, 112):
-            for debug in (False, True):
-                with self.subTest(agent_code=agent_code, debug=debug):
-                    self.libvirt.registerErrorHandler.reset_mock()
-                    output, errors = io.StringIO(), io.StringIO()
-                    root = autoreclaim.logging.getLogger()
-                    previous_level = root.level
-                    try:
-                        with patch.dict(sys.modules, {"libvirt_qemu": qemu_module}), \
-                                patch.object(root, "handlers", []), \
-                                redirect_stdout(output), redirect_stderr(errors):
-                            autoreclaim.libvirt_autoreclaim(
-                                ["libvirt-autoreclaim"] + (["--debug"] if debug else []) + ["status"])
-                    finally:
-                        root.setLevel(previous_level)
-                    self.assertIn("unavailable", output.getvalue().splitlines()[1].split())
-                    self.assertIn("Unrelated libvirt failure", errors.getvalue())
-                    self.assertEqual(errors.getvalue().count("Guest agent unavailable"), int(debug))
+            for action in ("start", "status"):
+                for debug in (False, True):
+                    with self.subTest(agent_code=agent_code, action=action, debug=debug):
+                        self.libvirt.registerErrorHandler.reset_mock()
+                        output, errors = io.StringIO(), io.StringIO()
+                        root = autoreclaim.logging.getLogger()
+                        previous_level = root.level
+                        try:
+                            with patch.dict(sys.modules, {"libvirt_qemu": qemu_module}), \
+                                    patch.object(root, "handlers", []), \
+                                    patch.object(autoreclaim.LibVirtAutoReclaim, "daemon",
+                                                 autospec=True,
+                                                 side_effect=lambda controller: controller.status()), \
+                                    redirect_stdout(output), redirect_stderr(errors):
+                                autoreclaim.libvirt_autoreclaim(
+                                    ["libvirt-autoreclaim"] + (["--debug"] if debug else []) + [action])
+                        finally:
+                            root.setLevel(previous_level)
+                        self.assertIn("unavailable", output.getvalue().splitlines()[1].split())
+                        self.assertIn("Unrelated libvirt failure", errors.getvalue())
+                        self.assertEqual(errors.getvalue().count("Guest agent unavailable"), int(debug))
+                        self.libvirt.registerErrorHandler.assert_called_with(None, None)
 
     def test_new_domains_follow_selection_and_xml_requirements(self):
         for event in (self.libvirt.VIR_DOMAIN_EVENT_DEFINED,
@@ -1225,11 +1230,15 @@ class LifecycleTests(unittest.TestCase):
             "</memballoon></devices></domain>")
         self.conn.listAllDomains.return_value = [inactive, self.domain]
 
-        self.controller.dom_print_names()
+        with patch.object(autoreclaim.logging, "info") as info:
+            self.controller.dom_print_names()
 
-        self.assertEqual(self.controller.monitored_vms, {"guest-inactive", "guest-new"})
+        self.assertEqual(self.controller.monitored_vms, {"guest-new"})
         self.assertEqual(self.controller.stats_periods, {"guest-new": 4})
         self.assertEqual(self.controller.poll_interval, 4)
+        info.assert_any_call("Monitoring %s", "guest-new")
+        self.assertNotIn(("Monitoring %s", "guest-inactive"),
+                         [call.args for call in info.call_args_list])
 
     def test_stopped_crashed_and_removed_domains_clear_tracking(self):
         self.domain.ID.return_value = -1
@@ -1311,6 +1320,22 @@ class LifecycleTests(unittest.TestCase):
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_RESUMED)
         self.config_open.assert_not_called()
+
+    def test_configuration_logs_loading_then_only_changed_reloads(self):
+        with self.assertLogs(level="INFO") as logs:
+            self.controller = autoreclaim.LibVirtAutoReclaim()
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
+            self.config_open.return_value.read.return_value = (
+                '{"default": {"auto_reclaim": true, "keep_free_kb": 786432}, "vms": []}')
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
+            self.config_open.return_value.read.return_value = json.dumps(
+                self.controller.config, indent=2, sort_keys=True)
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
+        self.assertEqual(
+            [record.getMessage() for record in logs.records
+             if "config file:" in record.getMessage()],
+            ["Loading config file: /etc/libvirt/autoreclaim.json",
+             "Reloading config file: /etc/libvirt/autoreclaim.json"])
 
     def test_monitoring_logs_only_changes_across_reload_and_lifecycle_events(self):
         with patch.object(autoreclaim.logging, "info") as info:
