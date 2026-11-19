@@ -89,8 +89,10 @@ statistics source (`balloon`, `guest-agent`, or `unavailable`) and the memory
 method (`balloon`, `virtio-mem`, or `read-only`), as well as memory values in
 MiB and the effective memory weight. Column widths adapt to domain names and
 values. Connection, configuration-loading, and monitoring messages are hidden
-by default; warnings and errors remain visible. Use `--debug status` to include
-diagnostic messages on stderr. The `start` command retains informational logs.
+by default. An unresponsive or disconnected QEMU Guest Agent is reported only
+with `--debug status`; if no other statistics are available, `Stats_Source`
+shows `unavailable`. Other warnings and errors remain visible. The `start`
+command retains informational logs.
 Informational messages have no level prefix; other log levels retain their
 prefixes (`DEBUG`, `WARNING`, `ERROR`).
 

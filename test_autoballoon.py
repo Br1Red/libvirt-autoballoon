@@ -1011,7 +1011,11 @@ class LifecycleTests(unittest.TestCase):
             VIR_DOMAIN_EVENT_STOPPED=5,
             VIR_DOMAIN_EVENT_CRASHED=8,
             VIR_DOMAIN_EVENT_ID_LIFECYCLE=0,
+            VIR_ERR_AGENT_UNRESPONSIVE=86,
+            VIR_ERR_AGENT_COMMAND_TIMEOUT=112,
+            VIR_ERR_WARNING=1,
             open=Mock(return_value=self.conn),
+            registerErrorHandler=Mock(),
             virEventRegisterDefaultImpl=Mock(),
             virEventAddTimeout=Mock(return_value=7),
             virEventUpdateTimeout=Mock(),
@@ -1069,6 +1073,47 @@ class LifecycleTests(unittest.TestCase):
                     self.assertIn("Monitoring guest-new", errors.getvalue().splitlines())
                 else:
                     self.assertEqual(errors.getvalue(), "")
+
+    def test_status_hides_agent_unavailability_but_keeps_other_libvirt_errors(self):
+        self.domain.XMLDesc.return_value = (
+            "<domain><devices>"
+            "<channel type='spicevmc'/>"
+            "<channel type='unix'><target name='org.qemu.guest_agent.0'/></channel>"
+            "</devices></domain>")
+        self.domain.info.return_value = (1, 8388608, 1048576, 1, 0)
+        self.conn.listDomainsID.return_value = [1]
+        self.conn.lookupByID.return_value = self.domain
+
+        def qemu_agent_command(*_args):
+            report = self.libvirt.registerErrorHandler.call_args
+            for code, message in ((42, "Unrelated libvirt failure"),
+                                  (agent_code, "Guest agent unavailable")):
+                if report is None:
+                    print(message, file=sys.stderr)
+                else:
+                    handler, context = report.args
+                    handler(context, (code, 10, message, 2, None, None, None, 0, 0))
+            raise self.libvirt.libvirtError("Guest agent unavailable")
+
+        qemu_module = types.SimpleNamespace(qemuAgentCommand=qemu_agent_command)
+        for agent_code in (86, 112):
+            for debug in (False, True):
+                with self.subTest(agent_code=agent_code, debug=debug):
+                    self.libvirt.registerErrorHandler.reset_mock()
+                    output, errors = io.StringIO(), io.StringIO()
+                    root = autoballoon.logging.getLogger()
+                    previous_level = root.level
+                    try:
+                        with patch.dict(sys.modules, {"libvirt_qemu": qemu_module}), \
+                                patch.object(root, "handlers", []), \
+                                redirect_stdout(output), redirect_stderr(errors):
+                            autoballoon.libvirt_autoballoon(
+                                ["libvirt-autoballoon"] + (["--debug"] if debug else []) + ["status"])
+                    finally:
+                        root.setLevel(previous_level)
+                    self.assertIn("unavailable", output.getvalue().splitlines()[1].split())
+                    self.assertIn("Unrelated libvirt failure", errors.getvalue())
+                    self.assertEqual(errors.getvalue().count("Guest agent unavailable"), int(debug))
 
     def test_new_domains_follow_selection_and_xml_requirements(self):
         for event in (self.libvirt.VIR_DOMAIN_EVENT_DEFINED,

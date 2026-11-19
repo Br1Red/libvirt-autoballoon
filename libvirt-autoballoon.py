@@ -861,6 +861,15 @@ def dom_virtio_mem(dom, target_total_kb, actual_total_kb):
 def handle_sigterm(signum, _frame):
     raise SystemExit(128 + signum)
 
+def report_status_libvirt_error(_context, error):
+    code, _, message, level = error[:4]
+    if (code == libvirt.VIR_ERR_AGENT_UNRESPONSIVE
+            or code == getattr(libvirt, "VIR_ERR_AGENT_COMMAND_TIMEOUT", None)):
+        # The guest-agent reader already reports the exception at debug level.
+        return
+    log = logging.warning if level == libvirt.VIR_ERR_WARNING else logging.error
+    log("libvirt: %s", message)
+
 def libvirt_autoballoon(argv):
     parser = argparse.ArgumentParser(prog="libvirt-autoballoon")
     parser.add_argument("-c", "--config", default="/etc/libvirt/autoballoon.json",
@@ -882,7 +891,11 @@ def libvirt_autoballoon(argv):
             if args.action == "start":
                 lv_ctrl.daemon()
             elif args.action == "status":
-                lv_ctrl.status()
+                libvirt.registerErrorHandler(report_status_libvirt_error, None)
+                try:
+                    lv_ctrl.status()
+                finally:
+                    libvirt.registerErrorHandler(None, None)
         finally:
             lv_ctrl.conn.close()
     finally:
