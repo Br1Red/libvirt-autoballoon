@@ -7,15 +7,16 @@ growth.
 
 ## VM Requirements
 
-A VM is monitored only when its effective configuration has `auto_memory: true`
-and its libvirt XML defines a balloon device or at least one virtio-mem device.
-Normally the balloon device must define a stats period from 1 to 5 seconds:
+Monitoring requires `auto_memory: true` in the VM's effective configuration.
+Automatic memory adjustments require an enabled balloon or at least one
+virtio-mem device. A balloon device normally defines a stats period from 1 to
+5 seconds:
 
-```
+```xml
 <devices>
-	<memballoon autodeflate='on'>
-		<stats period='5'/>
-	</memballoon>
+  <memballoon autodeflate='on'>
+    <stats period='5'/>
+  </memballoon>
 </devices>
 ```
 
@@ -40,10 +41,13 @@ read-only: the daemon does not attempt to adjust its memory.
 When a VM has virtio-mem devices but no balloon device, the QEMU Guest Agent
 channel is required to provide guest memory statistics. The daemon then adjusts
 memory by updating the virtio-mem device requests live; no SPICE channel is
-required. If both balloon and virtio-mem devices are configured, virtio-mem is
-used for adjustments. For multiple virtio-mem devices, the target is distributed
-across the devices in proportion to their configured sizes and aligned to each
-device's memory block size. The fixed RAM portion is never reduced.
+required. If both devices are enabled, the daemon adjusts only virtio-mem.
+When virtio-mem sizes are available, `Actual` is the fixed RAM plus the
+currently plugged virtio-mem, while `Usable` can still come from fresh balloon
+statistics. If the balloon has been adjusted separately, those values may not
+describe the same guest memory allocation. Prefer disabling the balloon with
+`<memballoon model='none'/>` and using QEMU Guest Agent for statistics on
+virtio-mem guests.
 
 The daemon uses `libvirt-python` with one persistent connection to
 `qemu:///system`. The polling interval is the minimum XML stats period among
@@ -59,8 +63,9 @@ are unavailable.
 After an initial inventory, libvirt lifecycle events discover newly defined
 or started VMs and recheck their monitoring requirements without restarting
 the daemon. Stopped, crashed, or removed VMs have their tracking state cleared;
-restarting a VM starts fresh manual-increase tracking. Undefining a running VM
-does not stop monitoring it. Whenever a VM starts, the daemon reloads the
+restarting a VM starts fresh manual-increase tracking. Running `virsh undefine`
+on an active, monitored VM does not stop monitoring it: it continues running
+as a transient domain. Whenever a VM starts, the daemon reloads the
 configuration file and rechecks monitoring for all VMs. The updated settings
 also apply to guests that are already running. If the file cannot be read or
 is invalid, the daemon logs an error and keeps the previous valid configuration.
@@ -94,25 +99,25 @@ values. If `auto_memory` is omitted from both places, it defaults to `false`.
 
 ```json
 {
-	"general": {
-		"psi_threshold": 5.0,
-		"host_min_free_ratio": 0.2
-	},
-	"default": {
-		"auto_memory": true,
-		"memory_weight": 100,
-		"keep_free_kb": 524288,
-		"keep_free_ratio": 0.1,
-		"ewma_alpha": 0.3,
-		"reclaim_ratio": 0.015,
-		"pd_kp": 0.5,
-		"pd_kd": 1.0,
-		"manual_increase_grace_seconds": 600
-	},
-	"vms": [
-		{"name": "guest-a", "auto_memory": false},
-		{"name": "guest-b", "keep_free_kb": 1048576, "memory_weight": 500}
-	]
+  "general": {
+    "psi_threshold": 5.0,
+    "host_min_free_ratio": 0.2
+  },
+  "default": {
+    "auto_memory": true,
+    "memory_weight": 100,
+    "keep_free_kb": 524288,
+    "keep_free_ratio": 0.1,
+    "ewma_alpha": 0.3,
+    "reclaim_ratio": 0.015,
+    "pd_kp": 0.5,
+    "pd_kd": 1.0,
+    "manual_increase_grace_seconds": 600
+  },
+  "vms": [
+    {"name": "guest-a", "auto_memory": false},
+    {"name": "guest-b", "keep_free_kb": 1048576, "memory_weight": 500}
+  ]
 }
 ```
 
@@ -144,8 +149,7 @@ the optional `general` section:
 | `psi_threshold` | `5.0` | Greater than 0, at most 100 | PSI `some avg10` percentage at which reclaim reaches full pressure |
 | `host_min_free_ratio` | `0.2` | Greater than 0, at most 1 | Host available-memory safety buffer as a fraction of total RAM |
 
-When `general` or an option is
-omitted, the documented built-in defaults apply.
+When `general` or an option is omitted, the documented built-in defaults apply.
 
 `manual_increase_grace_seconds` postpones reductions after the daemon detects
 that a VM's current memory increased without a request from the daemon. Set it
@@ -200,39 +204,39 @@ measurements before deploying:
 
 ```json
 {
-	"general": {
-		"psi_threshold": 5.0,
-		"host_min_free_ratio": 0.12
-	},
-	"default": {
-		"auto_memory": true,
-		"keep_free_kb": 524288,
-		"keep_free_ratio": 0.1,
-		"memory_weight": 100,
-		"ewma_alpha": 0.25,
-		"reclaim_ratio": 0.015,
-		"pd_kp": 0.4,
-		"pd_kd": 1.2,
-		"manual_increase_grace_seconds": 1800
-	},
-	"vms": [
-		{
-			"name": "db-prod-01",
-			"memory_weight": 500,
-			"keep_free_kb": 2097152,
-			"keep_free_ratio": 0.15,
-			"reclaim_ratio": 0.005,
-			"manual_increase_grace_seconds": 3600
-		},
-		{
-			"name": "ci-runner-01",
-			"memory_weight": 40,
-			"keep_free_kb": 262144,
-			"keep_free_ratio": 0.05,
-			"reclaim_ratio": 0.025,
-			"manual_increase_grace_seconds": 300
-		}
-	]
+  "general": {
+    "psi_threshold": 5.0,
+    "host_min_free_ratio": 0.12
+  },
+  "default": {
+    "auto_memory": true,
+    "keep_free_kb": 524288,
+    "keep_free_ratio": 0.1,
+    "memory_weight": 100,
+    "ewma_alpha": 0.25,
+    "reclaim_ratio": 0.015,
+    "pd_kp": 0.4,
+    "pd_kd": 1.2,
+    "manual_increase_grace_seconds": 1800
+  },
+  "vms": [
+    {
+      "name": "db-prod-01",
+      "memory_weight": 500,
+      "keep_free_kb": 2097152,
+      "keep_free_ratio": 0.15,
+      "reclaim_ratio": 0.005,
+      "manual_increase_grace_seconds": 3600
+    },
+    {
+      "name": "ci-runner-01",
+      "memory_weight": 40,
+      "keep_free_kb": 262144,
+      "keep_free_ratio": 0.05,
+      "reclaim_ratio": 0.025,
+      "manual_increase_grace_seconds": 300
+    }
+  ]
 }
 ```
 
@@ -356,8 +360,11 @@ contribution cannot exceed the current absolute error in either direction.
 Duplicate samples are not processed again; missing
 or invalid statistics are skipped, and statistics older than 15 seconds or
 dated in the future produce a warning and are skipped. A backwards timestamp
-resets the filter. Lifecycle transitions and configuration changes reset
-controller history, without discarding existing manual-increase grace periods.
+resets the filter. When a VM starts, only its own controller history is reset
+unless the reloaded configuration differs from the previous one. A configuration
+change resets controller history for all VMs without itself discarding existing
+manual-increase grace periods. Defining or resuming a VM also resets its own
+controller history.
 The status command's `Keep_Usable` column shows the effective reserve.
 Its `Weight` column shows the effective `memory_weight`, including inheritance
 from `default` or the built-in default of 100. Higher weights mean higher
@@ -377,7 +384,7 @@ reserve deficit and another polling interval of positive consumption trend,
 whichever is larger. Ordinary positive PD corrections are capped at 50% of
 current RAM per sample. All requests are capped at the VM's maximum memory.
 Progress toward an outstanding growth request does not trigger manual-increase
-grace periods. Ordinary adjustments wait until the previous balloon request
+grace periods. Ordinary adjustments wait until the previous memory request
 completes, rather than reversing or replacing a request still in flight.
 Emergency growth can supersede an outstanding request with a higher target.
 Uncompleted requests expire after 30 seconds, with a warning, so an unresponsive
@@ -389,18 +396,25 @@ The minimum RAM target accounts for both the absolute reserve and the configured
 ratio, capped at the VM's maximum:
 
 ```
-Floor = min(maximum_ram, int(2 * keep_free_kb / max(0.1, 1 - keep_free_ratio)))
+ReserveFloor = int(2 * keep_free_kb / max(0.1, 1 - keep_free_ratio))
+Floor = min(maximum_ram, max(minimum_ram, ReserveFloor))
 ```
 
-The denominator is bounded below by 0.1, including for ratios near or equal to
-1. A VM below this floor can be grown to it even when its instantaneous reserve
-is sufficient. The proportional reserve still uses current RAM, not the VM's
-historical or maximum RAM. A VM whose maximum is too small cannot maintain the
-configured reserve.
-Targets are capped at the VM's maximum and rounded down to a multiple of 4 KiB.
-Adjustments smaller than 1 MiB are then skipped based on the absolute difference
-in KiB. Logs display MiB with three decimal places; the same page-aligned KiB
-target is sent to libvirt and recorded in pending requests.
+`minimum_ram` is zero for balloon and the fixed (non-virtio-mem) RAM for
+virtio-mem. The denominator is bounded below by 0.1, including for ratios near
+or equal to 1. A VM below this floor can be grown to it even when its
+instantaneous reserve is sufficient. The proportional reserve still uses
+current RAM, not the VM's historical or maximum RAM. A VM whose maximum is too
+small cannot maintain the configured reserve.
+
+- **Balloon:** Round the capped target down to a multiple of 4 KiB. Skip the
+  adjustment if the rounded target differs from current RAM by less than 1 MiB.
+- **Virtio-mem:** Split the portion above fixed RAM among devices in proportion
+  to their configured capacities, then round each request to the nearest
+  multiple of that device's block size (2 MiB if unspecified). Skip the
+  adjustment if the combined target, including fixed RAM, differs from current
+  RAM by less than the larger of 1 MiB and the smallest device block size.
+
 These limits reduce risk; they do not guarantee that a guest will avoid OOM.
 
 ### Host pressure and reclaim priority
@@ -443,11 +457,6 @@ actual * reclaim_ratio * Elapsed * Pressure * idle_ratio * min(2.0, 100.0 / memo
 samples, bounded below by one second. The first sample uses the VM's XML stats
 period. This keeps the base reclaim rate independent of the polling interval
 and of other VMs' stats periods.
-
-`reclaim_ratio` is now a per-second rate, rather than a per-sample fraction.
-The new default `0.015` preserves the old default's base rate at a 2-second
-stats period. Divide an existing explicit value by 2 to preserve its base rate
-at that period (for example, change `0.03` to `0.015`).
 
 Weight 100 preserves the normal rate. Weight 500 reclaims at one fifth of that
 rate, while weights of 50 or less are capped at twice the base rate. Emergency
