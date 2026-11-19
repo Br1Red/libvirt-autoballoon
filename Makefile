@@ -2,13 +2,13 @@ PREFIX ?= /
 
 SRC_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 
-S_SERVICE := $(SRC_DIR)/libvirt-autoballoon.service
-S_BIN := $(SRC_DIR)/libvirt-autoballoon.py
-S_CONF := $(SRC_DIR)/autoballoon.json
+S_SERVICE := $(SRC_DIR)/libvirt-autoreclaim.service
+S_BIN := $(SRC_DIR)/libvirt-autoreclaim.py
+S_CONF := $(SRC_DIR)/autoreclaim.json
 
-SERVICE := $(PREFIX)/lib/systemd/system/libvirt-autoballoon.service
-BIN := $(PREFIX)/usr/bin/libvirt-autoballoon
-CONF := $(PREFIX)/etc/libvirt/autoballoon.json
+SERVICE := $(PREFIX)/lib/systemd/system/libvirt-autoreclaim.service
+BIN := $(PREFIX)/usr/bin/libvirt-autoreclaim
+CONF := $(PREFIX)/etc/libvirt/autoreclaim.json
 
 default:  help
 
@@ -21,10 +21,10 @@ $(SERVICE): $(S_SERVICE)
 $(CONF): $(S_CONF)
 	install -Dm644 $< $@
 
-install: ## Install libvirt-autoballoon
+install: ## Install libvirt-autoreclaim
 install: $(BIN) $(SERVICE) $(CONF)
 
-uninstall: ## Delete libvirt-autoballoon
+uninstall: ## Delete libvirt-autoreclaim
 uninstall:
 	@rm -fv $(BIN) $(SERVICE) $(CONF)
 

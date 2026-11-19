@@ -4,7 +4,7 @@
 		"host_min_free_ratio": 0.2
 	},
 	"default": {
-		"auto_memory": true,
+		"auto_reclaim": true,
 		"memory_weight": 100,
 		"keep_free_kb": 524288,
 		"keep_free_ratio": 0.1,
@@ -15,7 +15,7 @@
 		"manual_increase_grace_seconds": 600
 	},
 	"vms": [
-		{"name": "guest-a", "auto_memory": false},
+		{"name": "guest-a", "auto_reclaim": false},
 		{"name": "guest-b", "keep_free_kb": 1048576, "memory_weight": 500}
 	]
 }

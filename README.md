@@ -1,13 +1,13 @@
-# libvirt-autoballoon
+# libvirt-autoreclaim
 
-Daemon that reclaims unused memory from libvirt QEMU guests by adjusting their
-balloon or virtio-mem devices. An adaptive EWMA/PD controller balances guest
-reserves against host memory pressure, with slow reclaim and rapid guest memory
-growth.
+Daemon that reclaims unused memory from libvirt QEMU guests by adjusting guest
+memory through balloon or virtio-mem devices. An adaptive EWMA/PD controller
+balances guest reserves against host memory pressure, with slow reclaim and
+rapid guest memory growth.
 
 ## VM Requirements
 
-Monitoring requires `auto_memory: true` in the VM's effective configuration.
+Monitoring requires `auto_reclaim: true` in the VM's effective configuration.
 Automatic memory adjustments require an enabled balloon or at least one
 virtio-mem device. A balloon device normally defines a stats period from 1 to
 5 seconds:
@@ -76,12 +76,12 @@ repeat these messages for unchanged VMs.
 
 ## Configuration
 
-The configuration file defaults to `/etc/libvirt/autoballoon.json`. Select a
+The configuration file defaults to `/etc/libvirt/autoreclaim.json`. Select a
 different file with `-c` or `--config`:
 
 ```
-libvirt-autoballoon --config /path/to/autoballoon.json start
-libvirt-autoballoon -c /path/to/autoballoon.json status
+libvirt-autoreclaim --config /path/to/autoreclaim.json start
+libvirt-autoreclaim -c /path/to/autoreclaim.json status
 ```
 
 `status` displays an aligned table of active monitored VMs, including the
@@ -97,7 +97,7 @@ Informational messages have no level prefix; other log levels retain their
 prefixes (`DEBUG`, `WARNING`, `ERROR`).
 
 The `default` section supplies values for every VM. A VM entry overrides those
-values. If `auto_memory` is omitted from both places, it defaults to `false`.
+values. If `auto_reclaim` is omitted from both places, it defaults to `false`.
 
 ```json
 {
@@ -106,7 +106,7 @@ values. If `auto_memory` is omitted from both places, it defaults to `false`.
     "host_min_free_ratio": 0.2
   },
   "default": {
-    "auto_memory": true,
+    "auto_reclaim": true,
     "memory_weight": 100,
     "keep_free_kb": 524288,
     "keep_free_ratio": 0.1,
@@ -117,7 +117,7 @@ values. If `auto_memory` is omitted from both places, it defaults to `false`.
     "manual_increase_grace_seconds": 600
   },
   "vms": [
-    {"name": "guest-a", "auto_memory": false},
+    {"name": "guest-a", "auto_reclaim": false},
     {"name": "guest-b", "keep_free_kb": 1048576, "memory_weight": 500}
   ]
 }
@@ -196,7 +196,7 @@ against host or guest OOM.
   the normal reclaim rate; weights below `50` do not increase the rate beyond
   the twofold cap, although they still affect processing order. Emergency
   growth remains independent of weight.
-- **`auto_memory`** can be set to `false` for workloads that should not be managed
+- **`auto_reclaim`** can be set to `false` for workloads that should not be managed
   by this daemon. Their memory must still fit within the host's capacity.
 
 This illustrative configuration combines a balanced shared profile with a
@@ -211,7 +211,7 @@ measurements before deploying:
     "host_min_free_ratio": 0.12
   },
   "default": {
-    "auto_memory": true,
+    "auto_reclaim": true,
     "keep_free_kb": 524288,
     "keep_free_ratio": 0.1,
     "memory_weight": 100,
@@ -320,7 +320,7 @@ periods on heavily overcommitted hosts unless sufficient host headroom exists.
 
 ### 5. Verify the result under load
 
-Use `libvirt-autoballoon status` to inspect `Actual`, `Usable`, `Keep_Usable`,
+Use `libvirt-autoreclaim status` to inspect `Actual`, `Usable`, `Keep_Usable`,
 and `Weight`. Observe host `MemAvailable` and `/proc/pressure/memory` alongside
 guest swap activity, disk I/O, and application latency. Enable `--debug` on
 the existing daemon invocation when investigating controller decisions; do not
@@ -483,6 +483,6 @@ Requires Python 3 and the `libvirt-python` bindings (for example, the
 
 ```
 ~# make install
-~# systemctl enable libvirt-autoballoon
-~# systemctl start libvirt-autoballoon
+~# systemctl enable libvirt-autoreclaim
+~# systemctl start libvirt-autoreclaim
 ```

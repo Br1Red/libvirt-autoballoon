@@ -11,9 +11,9 @@ from unittest.mock import Mock, mock_open, patch
 
 sys.modules.setdefault("libvirt", types.SimpleNamespace(
     libvirtError=type("LibvirtError", (Exception,), {})))
-spec = importlib.util.spec_from_file_location("autoballoon", "libvirt-autoballoon.py")
-autoballoon = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(autoballoon)
+spec = importlib.util.spec_from_file_location("autoreclaim", "libvirt-autoreclaim.py")
+autoreclaim = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(autoreclaim)
 
 
 class Domain:
@@ -42,15 +42,15 @@ class Domain:
 
 class LogFormattingTests(unittest.TestCase):
     def test_only_info_messages_omit_level_prefix(self):
-        formatter = autoballoon.LogFormatter("%(levelname)s %(message)s")
+        formatter = autoreclaim.LogFormatter("%(levelname)s %(message)s")
         for level, expected in (
-                (autoballoon.logging.INFO, "Monitoring guest-a"),
-                (autoballoon.logging.DEBUG, "DEBUG Monitoring guest-a"),
-                (autoballoon.logging.WARNING, "WARNING Monitoring guest-a"),
-                (autoballoon.logging.ERROR, "ERROR Monitoring guest-a")):
+                (autoreclaim.logging.INFO, "Monitoring guest-a"),
+                (autoreclaim.logging.DEBUG, "DEBUG Monitoring guest-a"),
+                (autoreclaim.logging.WARNING, "WARNING Monitoring guest-a"),
+                (autoreclaim.logging.ERROR, "ERROR Monitoring guest-a")):
             with self.subTest(level=level):
-                record = autoballoon.logging.LogRecord(
-                    "autoballoon", level, __file__, 1, "Monitoring %s", ("guest-a",), None)
+                record = autoreclaim.logging.LogRecord(
+                    "autoreclaim", level, __file__, 1, "Monitoring %s", ("guest-a",), None)
                 self.assertEqual(formatter.format(record), expected)
 
 
@@ -61,7 +61,7 @@ class BalloonAdjustmentTests(unittest.TestCase):
             with self.subTest(delta=delta):
                 domain = Domain()
                 domain.memory = actual
-                requested = autoballoon.dom_balloon(domain, actual + delta, actual, domain.maximum)
+                requested = autoreclaim.dom_balloon(domain, actual + delta, actual, domain.maximum)
                 self.assertIsNone(requested)
                 self.assertEqual(domain.calls, [])
 
@@ -74,7 +74,7 @@ class BalloonAdjustmentTests(unittest.TestCase):
                 domain = Domain()
                 domain.memory = actual
                 target = actual + delta
-                requested = autoballoon.dom_balloon(domain, target, actual, domain.maximum)
+                requested = autoreclaim.dom_balloon(domain, target, actual, domain.maximum)
                 self.assertEqual(requested, actual + aligned_delta)
                 self.assertEqual(domain.calls, [actual + aligned_delta])
 
@@ -83,7 +83,7 @@ class BalloonAdjustmentTests(unittest.TestCase):
         domain = Domain()
         domain.memory = actual
         domain.maximum = actual + 1023
-        requested = autoballoon.dom_balloon(domain, actual + 2048, actual, domain.maximum)
+        requested = autoreclaim.dom_balloon(domain, actual + 2048, actual, domain.maximum)
         self.assertIsNone(requested)
         self.assertEqual(domain.calls, [])
 
@@ -91,7 +91,7 @@ class BalloonAdjustmentTests(unittest.TestCase):
         domain = Domain()
         domain.maximum = domain.memory + 2047
         expected = domain.memory + 2044
-        requested = autoballoon.dom_balloon(
+        requested = autoreclaim.dom_balloon(
             domain, domain.memory + 4096, domain.memory, domain.maximum)
         self.assertEqual(requested, expected)
         self.assertEqual(domain.calls, [expected])
@@ -115,13 +115,13 @@ class VirtioMemAdjustmentTests(unittest.TestCase):
             VIR_DOMAIN_AFFECT_LIVE=1,
         )
 
-        with patch.object(autoballoon, "libvirt", libvirt_mock):
-            requested = autoballoon.dom_virtio_mem(domain, 2097152, 1572864)
+        with patch.object(autoreclaim, "libvirt", libvirt_mock):
+            requested = autoreclaim.dom_virtio_mem(domain, 2097152, 1572864)
 
         self.assertEqual(requested, 2097152)
         domain.updateDeviceFlags.assert_called_once()
         updated_xml, flags = domain.updateDeviceFlags.call_args.args
-        updated_device = autoballoon.ET.fromstring(updated_xml)
+        updated_device = autoreclaim.ET.fromstring(updated_xml)
         self.assertEqual(flags, libvirt_mock.VIR_DOMAIN_AFFECT_LIVE)
         self.assertEqual(updated_device.findtext("./target/requested"), "1048576")
         self.assertIsNone(updated_device.find("./target/current"))
@@ -129,9 +129,9 @@ class VirtioMemAdjustmentTests(unittest.TestCase):
 
 class AdaptiveControllerTests(unittest.TestCase):
     def setUp(self):
-        self.controller = autoballoon.LibVirtAutoBalloon.__new__(autoballoon.LibVirtAutoBalloon)
+        self.controller = autoreclaim.LibVirtAutoReclaim.__new__(autoreclaim.LibVirtAutoReclaim)
         self.controller.config = {"default": {}, "vms": [
-            {"name": "guest-a", "auto_memory": True, "manual_increase_grace_seconds": 3600}
+            {"name": "guest-a", "auto_reclaim": True, "manual_increase_grace_seconds": 3600}
         ]}
         self.controller.monitored_vms = {"guest-a"}
         self.controller.guest_agents = set()
@@ -146,7 +146,7 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.domain = Domain()
         self.now = 100
         for clock in ("monotonic", "time"):
-            clock_patch = patch.object(autoballoon, clock, side_effect=lambda: self.now)
+            clock_patch = patch.object(autoreclaim, clock, side_effect=lambda: self.now)
             clock_patch.start()
             self.addCleanup(clock_patch.stop)
 
@@ -297,8 +297,8 @@ class AdaptiveControllerTests(unittest.TestCase):
         }
         vmem_info = {"max_ram_kb": self.domain.maximum, "base_ram_kb": 262144}
         with patch.object(self.controller, "_inspect_virtio_mem_devices", return_value=vmem_info):
-            with patch.object(autoballoon, "dom_virtio_mem", return_value=2097152) as adjust_vmem:
-                with patch.object(autoballoon, "dom_balloon") as adjust_balloon:
+            with patch.object(autoreclaim, "dom_virtio_mem", return_value=2097152) as adjust_vmem:
+                with patch.object(autoreclaim, "dom_balloon") as adjust_balloon:
                     self.controller.process_domainID(self.domain, 0, stats)
 
         adjust_vmem.assert_called_once()
@@ -336,7 +336,7 @@ class AdaptiveControllerTests(unittest.TestCase):
                         with patch.object(
                                 self.controller, "_inspect_virtio_mem_devices", return_value=vmem_info):
                             with patch.object(
-                                    autoballoon, "dom_virtio_mem", side_effect=request_virtio_mem):
+                                    autoreclaim, "dom_virtio_mem", side_effect=request_virtio_mem):
                                 self.controller.process_domains()
 
         self.assertEqual(requested_targets[0], self.domain.memory)
@@ -640,7 +640,7 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.domain.memory = 2097152
         self.domain.usable = 614400
         self.controller.config["default"].update({"ewma_alpha": 0.5, "pd_kd": 10})
-        self.controller.control_samples["guest-a"] = autoballoon.MemorySample(
+        self.controller.control_samples["guest-a"] = autoreclaim.MemorySample(
             1925120, 1925120, -131072, 99)
         self.controller.process_domainID(self.domain, 1)
         self.assertEqual(self.domain.calls, [2097152 + 196608])
@@ -654,7 +654,7 @@ class AdaptiveControllerTests(unittest.TestCase):
                 self.controller.memory_targets.clear()
                 self.controller.pending_targets.clear()
                 self.controller.config["default"].update({"ewma_alpha": 0.5, "pd_kd": 0.5})
-                self.controller.control_samples["guest-a"] = autoballoon.MemorySample(
+                self.controller.control_samples["guest-a"] = autoreclaim.MemorySample(
                     1925120, 1925120, 65536, 99)
                 stats = self.domain.memoryStats()
                 stats["last_update"] = updated
@@ -835,7 +835,7 @@ class AdaptiveControllerTests(unittest.TestCase):
             requested = self.domain.calls[0]
             self.domain.memory = requested
             self.domain.usable = 524288
-            with patch.object(autoballoon.logging, "warning") as warning:
+            with patch.object(autoreclaim.logging, "warning") as warning:
                 self.step(seconds=30)
         warning.assert_not_called()
         self.assertEqual(self.controller.manual_increase_until, {})
@@ -857,7 +857,7 @@ class AdaptiveControllerTests(unittest.TestCase):
     def test_host_pressure_uses_configured_thresholds(self):
         self.controller.config["general"] = {
             "psi_threshold": 10, "host_min_free_ratio": 0.05}
-        self.controller._LibVirtAutoBalloon__validate_config_parameters(self.controller.config)
+        self.controller._LibVirtAutoReclaim__validate_config_parameters(self.controller.config)
         for psi, available, expected in ((0, 100, 0), (0, 25, 0.5),
                                          (5, 500, 0.5), (10, 500, 1)):
             with self.subTest(psi=psi, available=available):
@@ -947,12 +947,12 @@ class AdaptiveControllerTests(unittest.TestCase):
                         config["default"]["memory_weight"] = value
                     else:
                         config["vms"] = [{"name": "guest-a", "memory_weight": value}]
-                    with self.assertRaisesRegex(autoballoon.ExitFailure, "memory_weight"):
-                        self.controller._LibVirtAutoBalloon__validate_config_parameters(config)
+                    with self.assertRaisesRegex(autoreclaim.ExitFailure, "memory_weight"):
+                        self.controller._LibVirtAutoReclaim__validate_config_parameters(config)
         for value in (1, 100, 1000):
             config = {"default": {"memory_weight": value},
                       "vms": [{"name": "guest-a", "memory_weight": value}]}
-            self.controller._LibVirtAutoBalloon__validate_config_parameters(config)
+            self.controller._LibVirtAutoReclaim__validate_config_parameters(config)
 
     def test_invalid_controller_parameters_are_rejected(self):
         for key, values in {
@@ -968,8 +968,8 @@ class AdaptiveControllerTests(unittest.TestCase):
                 with self.subTest(key=key, value=value):
                     scope = "general" if key in ("psi_threshold", "host_min_free_ratio") else "default"
                     config = {scope: {key: value}, "vms": []}
-                    with self.assertRaises(autoballoon.ExitFailure):
-                        self.controller._LibVirtAutoBalloon__validate_config_parameters(config)
+                    with self.assertRaises(autoreclaim.ExitFailure):
+                        self.controller._LibVirtAutoReclaim__validate_config_parameters(config)
 
     def test_host_pressure_settings_are_only_accepted_in_general(self):
         for key in ("psi_threshold", "host_min_free_ratio"):
@@ -980,22 +980,22 @@ class AdaptiveControllerTests(unittest.TestCase):
                         config["default"][key] = 0.5
                     else:
                         config["vms"] = [{"name": "guest-a", key: 0.5}]
-                    with self.assertRaisesRegex(autoballoon.ExitFailure, "only supported in general"):
-                        self.controller._LibVirtAutoBalloon__validate_config_parameters(config)
+                    with self.assertRaisesRegex(autoreclaim.ExitFailure, "only supported in general"):
+                        self.controller._LibVirtAutoReclaim__validate_config_parameters(config)
 
     def test_general_rejects_vm_and_unknown_settings(self):
-        for parameters in ({"keep_free_kb": 524288}, {"auto_memory": True},
+        for parameters in ({"keep_free_kb": 524288}, {"auto_reclaim": True},
                            {"memory_weight": 100}, {"psi_threshol": 5}):
             with self.subTest(parameters=parameters):
                 config = {"general": parameters, "vms": []}
-                with self.assertRaisesRegex(autoballoon.ExitFailure, "Unsupported general parameters"):
-                    self.controller._LibVirtAutoBalloon__validate_config_parameters(config)
+                with self.assertRaisesRegex(autoreclaim.ExitFailure, "Unsupported general parameters"):
+                    self.controller._LibVirtAutoReclaim__validate_config_parameters(config)
 
     def test_invalid_grace_is_rejected(self):
         for value in (-1, 1.5, True, "60"):
             self.controller.config["vms"][0]["manual_increase_grace_seconds"] = value
-            with self.subTest(value=value), self.assertRaises(autoballoon.ExitFailure):
-                self.controller._LibVirtAutoBalloon__validate_config_parameters(self.controller.config)
+            with self.subTest(value=value), self.assertRaises(autoreclaim.ExitFailure):
+                self.controller._LibVirtAutoReclaim__validate_config_parameters(self.controller.config)
 
 
 class LifecycleTests(unittest.TestCase):
@@ -1022,14 +1022,14 @@ class LifecycleTests(unittest.TestCase):
             virEventRemoveTimeout=Mock(),
             virEventRunDefaultImpl=Mock(),
         )
-        libvirt_patch = patch.object(autoballoon, "libvirt", self.libvirt)
+        libvirt_patch = patch.object(autoreclaim, "libvirt", self.libvirt)
         libvirt_patch.start()
         self.addCleanup(libvirt_patch.stop)
-        self.config_open = mock_open(read_data='{"default": {"auto_memory": true}, "vms": []}')
+        self.config_open = mock_open(read_data='{"default": {"auto_reclaim": true}, "vms": []}')
         config_patch = patch("builtins.open", self.config_open)
         config_patch.start()
         self.addCleanup(config_patch.stop)
-        self.controller = autoballoon.LibVirtAutoBalloon()
+        self.controller = autoreclaim.LibVirtAutoReclaim()
         self.domain = Mock()
         self.domain.name.return_value = "guest-new"
         self.domain.isActive.return_value = 1
@@ -1039,7 +1039,7 @@ class LifecycleTests(unittest.TestCase):
         self.conn.listAllDomains.return_value = [self.domain]
 
     def lifecycle(self, event):
-        self.controller._LibVirtAutoBalloon__domain_lifecycle(
+        self.controller._LibVirtAutoReclaim__domain_lifecycle(
             self.conn, self.domain, event, 0, None)
 
     def test_status_cli_only_prints_table_even_with_excluded_domains(self):
@@ -1048,21 +1048,21 @@ class LifecycleTests(unittest.TestCase):
         excluded = Mock()
         excluded.name.return_value = "excluded"
         self.config_open.return_value.read.return_value = (
-            '{"default": {"auto_memory": true}, '
-            '"vms": [{"name": "excluded", "auto_memory": false}]}')
+            '{"default": {"auto_reclaim": true}, '
+            '"vms": [{"name": "excluded", "auto_reclaim": false}]}')
         self.conn.listAllDomains.return_value = [self.domain, excluded]
         self.conn.listDomainsID.return_value = [1]
         self.conn.lookupByID.return_value = self.domain
         for debug in (False, True):
             with self.subTest(debug=debug):
                 output, errors = io.StringIO(), io.StringIO()
-                root = autoballoon.logging.getLogger()
+                root = autoreclaim.logging.getLogger()
                 previous_level = root.level
                 try:
                     with patch.object(root, "handlers", []):
                         with redirect_stdout(output), redirect_stderr(errors):
-                            autoballoon.libvirt_autoballoon(
-                                ["libvirt-autoballoon"] + (["--debug"] if debug else []) + ["status"])
+                            autoreclaim.libvirt_autoreclaim(
+                                ["libvirt-autoreclaim"] + (["--debug"] if debug else []) + ["status"])
                 finally:
                     root.setLevel(previous_level)
                 self.assertEqual(len(output.getvalue().splitlines()), 2)
@@ -1101,14 +1101,14 @@ class LifecycleTests(unittest.TestCase):
                 with self.subTest(agent_code=agent_code, debug=debug):
                     self.libvirt.registerErrorHandler.reset_mock()
                     output, errors = io.StringIO(), io.StringIO()
-                    root = autoballoon.logging.getLogger()
+                    root = autoreclaim.logging.getLogger()
                     previous_level = root.level
                     try:
                         with patch.dict(sys.modules, {"libvirt_qemu": qemu_module}), \
                                 patch.object(root, "handlers", []), \
                                 redirect_stdout(output), redirect_stderr(errors):
-                            autoballoon.libvirt_autoballoon(
-                                ["libvirt-autoballoon"] + (["--debug"] if debug else []) + ["status"])
+                            autoreclaim.libvirt_autoreclaim(
+                                ["libvirt-autoreclaim"] + (["--debug"] if debug else []) + ["status"])
                     finally:
                         root.setLevel(previous_level)
                     self.assertIn("unavailable", output.getvalue().splitlines()[1].split())
@@ -1123,10 +1123,10 @@ class LifecycleTests(unittest.TestCase):
                 self.controller.monitored_vms.clear()
                 self.lifecycle(event)
                 self.assertIn("guest-new", self.controller.monitored_vms)
-        self.controller.config["default"]["auto_memory"] = False
+        self.controller.config["default"]["auto_reclaim"] = False
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
         self.assertNotIn("guest-new", self.controller.monitored_vms)
-        self.controller.config["default"]["auto_memory"] = True
+        self.controller.config["default"]["auto_reclaim"] = True
         for xml in ("<domain/>", "<domain>",
                     "<domain><devices><memballoon><stats period='6'/>"
                     "</memballoon></devices></domain>"):
@@ -1241,7 +1241,7 @@ class LifecycleTests(unittest.TestCase):
                 self.controller.memory_targets["guest-new"] = 1048576
                 self.controller.pending_targets["guest-new"] = (1048576, 100)
                 self.controller.manual_increase_until["guest-new"] = 3600
-                self.controller.control_samples["guest-new"] = autoballoon.MemorySample(1, 1, 1, 100)
+                self.controller.control_samples["guest-new"] = autoreclaim.MemorySample(1, 1, 1, 100)
                 self.lifecycle(event)
                 self.assertNotIn("guest-new", self.controller.monitored_vms)
                 self.assertNotIn("guest-new", self.controller.memory_targets)
@@ -1267,10 +1267,10 @@ class LifecycleTests(unittest.TestCase):
         self.controller.monitored_vms.add("guest-existing")
         self.controller.memory_targets["guest-existing"] = 1048576
         self.controller.manual_increase_until["guest-existing"] = 3600
-        self.controller.control_samples["guest-existing"] = autoballoon.MemorySample(1, 1, 1, 100)
+        self.controller.control_samples["guest-existing"] = autoreclaim.MemorySample(1, 1, 1, 100)
         self.config_open.return_value.read.return_value = (
-            '{"default": {"auto_memory": false}, "vms": ['
-            '{"name": "guest-new", "auto_memory": true, "keep_free_kb": 786432}]}')
+            '{"default": {"auto_reclaim": false}, "vms": ['
+            '{"name": "guest-new", "auto_reclaim": true, "keep_free_kb": 786432}]}')
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
         self.assertEqual(self.controller.monitored_vms, {"guest-new"})
         self.assertEqual(self.controller.dom_keep_usable(self.domain), 786432)
@@ -1279,13 +1279,13 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.controller.control_samples, {})
 
         self.config_open.return_value.read.return_value = (
-            '{"default": {"auto_memory": false}, "vms": []}')
+            '{"default": {"auto_reclaim": false}, "vms": []}')
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
         self.assertEqual(self.controller.monitored_vms, set())
 
     def test_failed_reload_keeps_previous_valid_configuration(self):
         previous_config = self.controller.config
-        sample = autoballoon.MemorySample(1, 1, 1, 100)
+        sample = autoreclaim.MemorySample(1, 1, 1, 100)
         self.controller.control_samples["guest-existing"] = sample
         for content in ('{', '{"default": {"ewma_alpha": -1}, "vms": []}',
                         '{"general": [], "vms": []}', '{"general": null, "vms": []}',
@@ -1313,7 +1313,7 @@ class LifecycleTests(unittest.TestCase):
         self.config_open.assert_not_called()
 
     def test_monitoring_logs_only_changes_across_reload_and_lifecycle_events(self):
-        with patch.object(autoballoon.logging, "info") as info:
+        with patch.object(autoreclaim.logging, "info") as info:
             self.controller.dom_print_names()
             info.assert_any_call("Monitoring %s", "guest-new")
             info.reset_mock()
@@ -1324,7 +1324,7 @@ class LifecycleTests(unittest.TestCase):
 
             info.reset_mock()
             self.config_open.return_value.read.return_value = (
-                '{"default": {"auto_memory": false}, "vms": []}')
+                '{"default": {"auto_reclaim": false}, "vms": []}')
             self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
             info.assert_any_call("Stopped monitoring %s", "guest-new")
             info.reset_mock()
@@ -1334,7 +1334,7 @@ class LifecycleTests(unittest.TestCase):
 
             info.reset_mock()
             self.config_open.return_value.read.return_value = (
-                '{"default": {"auto_memory": true}, "vms": []}')
+                '{"default": {"auto_reclaim": true}, "vms": []}')
             self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
             info.assert_any_call("Monitoring %s", "guest-new")
             info.reset_mock()
@@ -1349,7 +1349,7 @@ class LifecycleTests(unittest.TestCase):
         self.controller.memory_targets["guest-new"] = 1048576
         self.controller.manual_increase_until["guest-new"] = 3600
         self.conn.listAllDomains.return_value = []
-        with patch.object(autoballoon.logging, "info") as info:
+        with patch.object(autoreclaim.logging, "info") as info:
             self.controller.dom_print_names()
             self.controller.dom_print_names()
         self.assertEqual(
@@ -1405,7 +1405,7 @@ class LifecycleTests(unittest.TestCase):
         excluded.XMLDesc.return_value = (
             "<domain><devices><memballoon><stats period='1'/>"
             "</memballoon></devices></domain>")
-        self.controller.config["vms"] = [{"name": "guest-excluded", "auto_memory": False}]
+        self.controller.config["vms"] = [{"name": "guest-excluded", "auto_reclaim": False}]
         self.domain.XMLDesc.return_value = (
             "<domain><devices><memballoon><stats period='5'/>"
             "</memballoon></devices></domain>")
@@ -1427,7 +1427,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.controller.poll_interval, 1)
         self.controller.timer_id = 7
         self.config_open.return_value.read.return_value = (
-            '{"default": {"auto_memory": false}, "vms": []}')
+            '{"default": {"auto_reclaim": false}, "vms": []}')
         self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
         self.assertEqual(self.controller.monitored_vms, set())
         self.assertEqual(self.controller.stats_periods, {})
@@ -1508,40 +1508,40 @@ class LifecycleTests(unittest.TestCase):
         self.conn.domainEventRegisterAny.return_value = 3
         self.conn.listDomainsID.return_value = []
         self.libvirt.virEventRunDefaultImpl.return_value = -1
-        with self.assertRaisesRegex(autoballoon.ExitFailure, "event loop failed"):
+        with self.assertRaisesRegex(autoreclaim.ExitFailure, "event loop failed"):
             self.controller.daemon()
         self.libvirt.virEventRemoveTimeout.assert_called_once_with(7)
         self.conn.domainEventDeregisterAny.assert_called_once_with(3)
 
     def test_cli_closes_connection_on_failure(self):
-        with patch.object(autoballoon, "LibVirtAutoBalloon", return_value=self.controller):
-            with patch.object(self.controller, "daemon", side_effect=autoballoon.ExitFailure):
-                with self.assertRaises(autoballoon.ExitFailure):
-                    autoballoon.libvirt_autoballoon(["libvirt-autoballoon", "start"])
+        with patch.object(autoreclaim, "LibVirtAutoReclaim", return_value=self.controller):
+            with patch.object(self.controller, "daemon", side_effect=autoreclaim.ExitFailure):
+                with self.assertRaises(autoreclaim.ExitFailure):
+                    autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim", "start"])
         self.conn.close.assert_called_once_with()
 
     def test_sigterm_removes_timer_deregisters_events_and_closes_connection(self):
         self.conn.domainEventRegisterAny.return_value = 3
         self.conn.listDomainsID.return_value = []
         previous_handler = Mock()
-        with patch.object(autoballoon, "LibVirtAutoBalloon", return_value=self.controller):
-            with patch.object(autoballoon.signal, "signal", return_value=previous_handler) as signals:
+        with patch.object(autoreclaim, "LibVirtAutoReclaim", return_value=self.controller):
+            with patch.object(autoreclaim.signal, "signal", return_value=previous_handler) as signals:
                 self.libvirt.virEventRunDefaultImpl.side_effect = lambda: (
-                    signals.call_args_list[0].args[1](autoballoon.signal.SIGTERM, None))
+                    signals.call_args_list[0].args[1](autoreclaim.signal.SIGTERM, None))
                 with self.assertRaises(SystemExit) as stopped:
-                    autoballoon.libvirt_autoballoon(["libvirt-autoballoon", "start"])
+                    autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim", "start"])
                 self.assertEqual(stopped.exception.code, 143)
                 self.assertEqual(signals.call_count, 2)
-                signals.assert_called_with(autoballoon.signal.SIGTERM, previous_handler)
+                signals.assert_called_with(autoreclaim.signal.SIGTERM, previous_handler)
         self.libvirt.virEventRemoveTimeout.assert_called_once_with(7)
         self.conn.domainEventDeregisterAny.assert_called_once_with(3)
         self.conn.close.assert_called_once_with()
 
     def test_termination_during_configuration_load_closes_connection(self):
-        with patch.object(autoballoon.LibVirtAutoBalloon, "_LibVirtAutoBalloon__load_config",
+        with patch.object(autoreclaim.LibVirtAutoReclaim, "_LibVirtAutoReclaim__load_config",
                           side_effect=SystemExit(143)):
             with self.assertRaises(SystemExit):
-                autoballoon.LibVirtAutoBalloon()
+                autoreclaim.LibVirtAutoReclaim()
         self.conn.close.assert_called_once_with()
 
 

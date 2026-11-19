@@ -57,12 +57,12 @@ class LogFormatter(logging.Formatter):
             return record.message
         return super().formatMessage(record)
 
-class LibVirtAutoBalloon:
+class LibVirtAutoReclaim:
     poll_interval = 5
     conn = None
     config = None
 
-    def __init__(self, qemu_addr='qemu:///system', configfile='/etc/libvirt/autoballoon.json'):
+    def __init__(self, qemu_addr='qemu:///system', configfile='/etc/libvirt/autoreclaim.json'):
         self.configfile = configfile
         self.monitored_vms = set()
         self.guest_agents = set()
@@ -592,7 +592,7 @@ class LibVirtAutoBalloon:
         self.guest_agents.discard(name)
         self.read_only_vms.discard(name)
         self.stats_periods.pop(name, None)
-        if self.__vm_config_for_name(name).get("auto_memory", False) is not True:
+        if self.__vm_config_for_name(name).get("auto_reclaim", False) is not True:
             return False
         try:
             domain_xml = ET.fromstring(dom.XMLDesc(0))
@@ -870,9 +870,9 @@ def report_status_libvirt_error(_context, error):
     log = logging.warning if level == libvirt.VIR_ERR_WARNING else logging.error
     log("libvirt: %s", message)
 
-def libvirt_autoballoon(argv):
-    parser = argparse.ArgumentParser(prog="libvirt-autoballoon")
-    parser.add_argument("-c", "--config", default="/etc/libvirt/autoballoon.json",
+def libvirt_autoreclaim(argv):
+    parser = argparse.ArgumentParser(prog="libvirt-autoreclaim")
+    parser.add_argument("-c", "--config", default="/etc/libvirt/autoreclaim.json",
                         help="path to the configuration file (default: %(default)s)")
     parser.add_argument("-d", "--debug", action="store_true",
                         help="enable debug output")
@@ -886,7 +886,7 @@ def libvirt_autoballoon(argv):
         handlers=[handler])
     previous_sigterm = signal.signal(signal.SIGTERM, handle_sigterm)
     try:
-        lv_ctrl = LibVirtAutoBalloon(configfile=args.config)
+        lv_ctrl = LibVirtAutoReclaim(configfile=args.config)
         try:
             if args.action == "start":
                 lv_ctrl.daemon()
@@ -902,7 +902,7 @@ def libvirt_autoballoon(argv):
         signal.signal(signal.SIGTERM, previous_sigterm)
 
 def main(argv):
-    libvirt_autoballoon(argv)
+    libvirt_autoreclaim(argv)
 
 if __name__ == '__main__':
     main(sys.argv)

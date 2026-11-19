@@ -1,11 +1,11 @@
 [Unit]
-Description=libvirt-autoballoon
+Description=libvirt-autoreclaim
 After=local-fs.target
-ConditionPathExists=/etc/libvirt/autoballoon.json
+ConditionPathExists=/etc/libvirt/autoreclaim.json
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/libvirt-autoballoon start
+ExecStart=/usr/bin/libvirt-autoreclaim start
 Nice=19
 SuccessExitStatus=143
 OOMScoreAdjust=-999
