@@ -42,6 +42,12 @@ def parse_xml_size_kb(element, default=0):
     unit = element.get("unit", "KiB").strip().lower()
     return int(raw_value * UNIT_MULTIPLIERS.get(unit, 1))
 
+def virtio_mem_base_ram_kb(domain_xml, total_size_kb):
+    domain_mem_kb = parse_xml_size_kb(domain_xml.find("./memory"))
+    if domain_mem_kb <= 0 or domain_mem_kb < total_size_kb:
+        raise ValueError("domain <memory> is missing or smaller than virtio-mem capacity")
+    return domain_mem_kb - total_size_kb
+
 class MemorySample(NamedTuple):
     used_ewma: float
     used: int
@@ -268,9 +274,6 @@ class LibVirtAutoReclaim:
             vmem_nodes = domain_xml.findall("./devices/memory[@model='virtio-mem']")
             if not vmem_nodes:
                 return None
-            total_domain_mem_kb = parse_xml_size_kb(domain_xml.find("./memory"), 0)
-            current_domain_mem_kb = parse_xml_size_kb(
-                domain_xml.find("./currentMemory"), total_domain_mem_kb)
             devices = []
             total_size_kb = 0
             total_requested_kb = 0
@@ -298,7 +301,7 @@ class LibVirtAutoReclaim:
                 total_size_kb += size_kb
                 total_requested_kb += requested_kb
                 total_current_kb += current_kb
-            base_ram_kb = max(0, current_domain_mem_kb - total_size_kb)
+            base_ram_kb = virtio_mem_base_ram_kb(domain_xml, total_size_kb)
             return {
                 "devices": devices,
                 "base_ram_kb": base_ram_kb,
@@ -785,8 +788,6 @@ def dom_virtio_mem(dom, target_total_kb, actual_total_kb):
     if not vmem_nodes:
         return None
     try:
-        current_domain_mem_kb = parse_xml_size_kb(
-            domain_xml.find("./currentMemory"), actual_total_kb)
         devices = []
         total_size_kb = 0
         for device in vmem_nodes:
@@ -809,12 +810,12 @@ def dom_virtio_mem(dom, target_total_kb, actual_total_kb):
                 "current_kb": current_kb,
             })
             total_size_kb += size_kb
+        if total_size_kb <= 0 or not devices:
+            return None
+        base_ram_kb = virtio_mem_base_ram_kb(domain_xml, total_size_kb)
     except (TypeError, ValueError) as error:
         logging.error("%s cannot parse virtio-mem sizes: %s", name, error)
         return None
-    if total_size_kb <= 0 or not devices:
-        return None
-    base_ram_kb = max(0, current_domain_mem_kb - total_size_kb)
     desired_vmem_total = max(0, min(total_size_kb, int(target_total_kb) - base_ram_kb))
     ratio = desired_vmem_total / float(total_size_kb)
     updates = []

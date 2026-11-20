@@ -101,7 +101,7 @@ class VirtioMemAdjustmentTests(unittest.TestCase):
     def test_dom_virtio_mem_updates_live_device_request(self):
         xml = (
             "<domain><memory unit='KiB'>3145728</memory>"
-            "<currentMemory unit='KiB'>3145728</currentMemory><devices>"
+            "<currentMemory unit='KiB'>1572864</currentMemory><devices>"
             "<memory model='virtio-mem'><target>"
             "<size unit='KiB'>2097152</size><block unit='KiB'>262144</block>"
             "<node>0</node><requested unit='KiB'>524288</requested>"
@@ -369,6 +369,22 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertEqual(stats["actual"], 1572864)
         self.assertEqual(stats["usable"], 1572864)
         self.assertEqual(stats["source"], "guest-agent")
+
+    def test_virtio_mem_status_includes_base_ram_with_balloon_stats(self):
+        self.controller.vm_backends["guest-a"] = {"type": "virtio-mem"}
+        self.domain.XMLDesc = Mock(return_value=(
+            "<domain><memory unit='KiB'>8388608</memory>"
+            "<currentMemory unit='KiB'>4325376</currentMemory><devices>"
+            "<memory model='virtio-mem'><target>"
+            "<size unit='KiB'>7340032</size><requested unit='KiB'>3407872</requested>"
+            "<current unit='KiB'>3276800</current>"
+            "</target></memory></devices></domain>"))
+        with patch.object(self.domain, "memoryStats", return_value={
+                "actual": 4325376, "usable": 2602964, "last_update": self.now}):
+            row = self.controller.dom_status(self.domain)
+
+        self.assertEqual(row[:7], (
+            "guest-a", "balloon", "virtio-mem", "8192", "4224", "1682", "2541"))
 
     def test_read_only_guest_agent_monitoring_does_not_change_memory(self):
         self.controller.read_only_vms.add("guest-a")
