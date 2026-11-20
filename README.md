@@ -87,9 +87,14 @@ The conversion modes are:
 - `to-virtiomem`: sets a fixed base memory and configures a `virtio-mem` device,
   NUMA topology, and maximum memory. The base defaults to `1GiB` and is rounded
   down to a multiple of 2 MiB. The generated NUMA cell excludes vCPU IDs
-  explicitly marked `enabled='no'`.
+  explicitly marked `enabled='no'`. By default, the balloon is disabled with
+  `model='none'`; `-k` (`--keep-balloon`) preserves its current model (or
+  creates a `virtio` balloon if one is absent).
 - `to-balloon`: removes `virtio-mem` devices and restores the VM's memory
-  configuration for `virtio-balloon`.
+  configuration for `virtio-balloon`. When NUMA cells are present, their memory
+  defines the fixed base, so any virtio-mem capacity already included in the
+  top-level `<memory>` is not counted twice. If the balloon model is `none`,
+  it is changed to `virtio`.
 
 Convert an XML file and save the result:
 
@@ -97,22 +102,45 @@ Convert an XML file and save the result:
 virtiomem_convert to-virtiomem vm.xml vm-virtiomem.xml --base-memory 2GiB
 ```
 
+With `to-virtiomem`, use `--initial-memory 3GiB` (or `-i 3GiB`) to start with
+3 GiB of total guest memory instead of the input XML's `<currentMemory>` (or
+`<memory>` if it is absent). The value must be between the fixed base and the
+selected maximum memory and is rounded down to a multiple of 2 MiB. In this
+direction, the option requires a domain without a `virtio-mem` device.
+
+With `to-balloon`, `--initial-memory` sets `<currentMemory>` directly, without
+2 MiB rounding or changing the calculated `<memory>`. The value must be
+positive and no greater than the resulting `<memory>`.
+
+Use `--max-memory SIZE` (or `-m SIZE`) to override the maximum total guest
+memory in either direction. With `to-virtiomem`, it replaces the input
+`<memory>` as the maximum, rounded down to a multiple of 2 MiB. With
+`to-balloon`, it sets the output `<memory>` directly. If the initial memory
+would exceed the new maximum, also specify a lower `--initial-memory`.
+
+To keep the existing balloon model during conversion:
+
+```bash
+virtiomem_convert to-virtiomem vm.xml vm-virtiomem.xml -k
+```
+
 The output XML is written atomically, so the input and output paths may be the
 same.
 
-Preview the changes without writing a file; `--color` can be `auto`, `always`,
-or `never`:
+Preview the changes without writing a file with `-n` (`--dry-run`).
+Use `-L` (`--color`) with `auto`, `always`, or `never`:
 
 ```bash
-virtiomem_convert to-virtiomem vm.xml --dry-run
+virtiomem_convert to-virtiomem vm.xml -n -L always
 ```
 
-To update a VM directly, it must be shut off, persistent, and have no snapshots.
-Preview first, then omit `--dry-run` to apply the conversion. `--connect`
-optionally selects the libvirt URI (otherwise `virsh` uses its default):
+To update a VM directly with `-V` (`--vm`), it must be shut off, persistent,
+and have no snapshots. Preview first, then omit `-n` to apply the conversion.
+`--connect` optionally selects the libvirt URI (otherwise `virsh` uses its
+default):
 
 ```bash
-virtiomem_convert to-virtiomem --vm guest-a --base-memory 2GiB --dry-run
+virtiomem_convert to-virtiomem -V guest-a --base-memory 2GiB -n
 virtiomem_convert to-virtiomem --vm guest-a --base-memory 2GiB
 virtiomem_convert to-balloon --vm guest-a
 ```

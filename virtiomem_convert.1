@@ -4,14 +4,19 @@ virtiomem_convert \- convert libvirt domain XML configurations between virtio-ba
 .SH SYNOPSIS
 .B virtiomem_convert
 .RB [ \-h ]
-.RB [ \-\-vm
-.IR VM_NAME ]
 .RB [ \-c
 .IR URI ]
+.RB [ \-V
+.IR VM_NAME ]
 .RB [ \-b
 .IR SIZE ]
-.RB [ \-\-dry\-run ]
-.RB [ \-\-color
+.RB [ \-i
+.IR SIZE ]
+.RB [ \-m
+.IR SIZE ]
+.RB [ \-k ]
+.RB [ \-n ]
+.RB [ \-L
 .IR WHEN ]
 .I mode
 .RI [ input_xml ]
@@ -67,13 +72,6 @@ is used.
 .BR \-h ", " \-\-help
 Show a help message and exit.
 .TP
-.BI \-\-vm " VM_NAME"
-Name of the libvirt virtual machine to modify directly via
-.BR virsh (1).
-The virtual machine must be in the
-.B shut off
-state, be persistent, and have no snapshots before running the command.
-.TP
 .BI \-c " URI" "\fR,\fP \-\-connect " URI
 Libvirt connection URI passed to
 .BR virsh (1)
@@ -81,6 +79,13 @@ Libvirt connection URI passed to
 .I qemu:///system
 or
 .IR qemu:///session ).
+.TP
+.BI \-V " VM_NAME" "\fR,\fP \-\-vm " VM_NAME
+Name of the libvirt virtual machine to modify directly via
+.BR virsh (1).
+The virtual machine must be in the
+.B shut off
+state, be persistent, and have no snapshots before running the command.
 .TP
 .BI \-b " SIZE" "\fR,\fP \-\-base\-memory " SIZE
 Minimum guaranteed static base memory when converting with
@@ -94,10 +99,61 @@ or raw integer values in KiB. The value is rounded down to a multiple of
 (2048 KiB). Defaults to
 .BR 1GiB .
 .TP
-.B \-\-dry\-run
+.BI \-i " SIZE" "\fR,\fP \-\-initial\-memory " SIZE
+Initial total guest memory. Uses the same units as
+.BR \-\-base\-memory .
+With
+.BR to\-virtiomem ,
+the domain must not already have a virtio-mem device. The value must be between
+the fixed base and the selected maximum memory and
+is rounded down to a multiple of 2 MiB. If omitted, the converter uses the
+original
+.B <currentMemory>
+or falls back to
+.BR <memory> .
+.IP
+With
+.BR to\-balloon ,
+sets
+.B <currentMemory>
+directly without 2 MiB rounding. The value must be positive and no greater
+than the resulting
+.BR <memory> .
+.TP
+.BI \-m " SIZE" "\fR,\fP \-\-max\-memory " SIZE
+Override the maximum total guest memory. Uses the same units as
+.BR \-\-base\-memory .
+With
+.BR to\-virtiomem ,
+replaces the input
+.B <memory>
+as the maximum and rounds it down to a multiple of 2 MiB. The domain must not
+already have a virtio-mem device. If the initial memory exceeds the new
+maximum, supply a lower
+.BR \-\-initial\-memory .
+With
+.BR to\-balloon ,
+sets the output
+.B <memory>
+directly. If the initial memory exceeds the new maximum, supply a lower
+.BR \-\-initial\-memory .
+.TP
+.BR \-k ", " \-\-keep\-balloon
+When converting with
+.BR to\-virtiomem ,
+leave the existing
+.B <memballoon>
+model unchanged instead of setting it to
+.BR none .
+If no balloon device exists, create a
+.B virtio
+balloon. This option is not valid with
+.BR to\-balloon .
+.TP
+.BR \-n ", " \-\-dry\-run
 Simulate the conversion and print a unified diff of the changes to standard output without modifying the virtual machine or writing any files.
 .TP
-.BI \-\-color " WHEN"
+.BI \-L " WHEN" "\fR,\fP \-\-color " WHEN
 Control ANSI color output for
 .BR \-\-dry\-run .
 .I WHEN
@@ -134,17 +190,22 @@ device with a 2048 KiB block size, setting
 .B <size>
 to the difference between maximum and base memory, and
 .B <requested>
-based on the initial
-.B <currentMemory>
-value.
+to the initial total memory (see
+.BR \-\-initial\-memory )
+minus the fixed base, rounded down to a 2 MiB block.
 .IP \(bu 2
-Removes the
+By default, sets
+.B <memballoon model='none'>
+and removes its
 .B autodeflate
-attribute from
-.B <memballoon>
-and ensures
+attribute and
+.B <stats>
+element. The
+.B \-\-keep\-balloon
+option leaves the current model unchanged and ensures
 .B <stats period='5'/>
-is present.
+is present when the model is not
+.BR none .
 .SS Mode: to-balloon
 .IP \(bu 2
 Removes all
@@ -153,13 +214,18 @@ devices and sums their
 .B <size>
 and
 .B <requested>
-values back into the static memory fields.
+values into the static memory fields. The fixed memory base is the sum of
+NUMA cell memory, if present; otherwise it is the original
+.BR <memory> .
 .IP \(bu 2
 Restores
 .B <memory>
 to the total maximum memory, updates
 .B <currentMemory>
-to the active amount, and removes
+to the fixed memory base plus the requested virtio-mem memory unless overridden
+by
+.BR \-\-initial\-memory ,
+and removes
 .BR <maxMemory> .
 .IP \(bu 2
 Removes the
@@ -168,7 +234,11 @@ element if it contains a single cell, or updates cell
 .B 0
 in multi-node topologies.
 .IP \(bu 2
-Sets
+Changes
+.B <memballoon model='none'>
+to
+.B <memballoon model='virtio'>,
+then sets
 .B autodeflate='on'
 and ensures
 .B <stats period='5'/>
