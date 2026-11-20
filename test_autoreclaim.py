@@ -315,7 +315,7 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.controller.conn.listDomainsID.return_value = [1]
         self.controller.conn.lookupByID.return_value = self.domain
         self.domain.memory = 4194304
-        self.domain.usable = 3145728
+        self.domain.usable = 2097152
         vmem_info = {"max_ram_kb": self.domain.maximum, "base_ram_kb": 1048576}
         requested_targets = []
 
@@ -323,8 +323,10 @@ class AdaptiveControllerTests(unittest.TestCase):
             requested_targets.append(target)
             return target if target != actual else None
 
-        for pressure in (0, 0.5, 1):
-            with self.subTest(pressure=pressure):
+        for pressure, usable in ((0, 2097152), (0.5, 2097152), (1, 2097152),
+                                 (0, 3407872), (1, 3407872)):
+            with self.subTest(pressure=pressure, usable=usable):
+                self.domain.usable = usable
                 self.controller.memory_targets.clear()
                 self.controller.pending_targets.clear()
                 self.controller.control_samples.clear()
@@ -342,6 +344,8 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertEqual(requested_targets[0], self.domain.memory)
         self.assertGreater(requested_targets[1], requested_targets[2])
         self.assertLess(requested_targets[2], self.domain.memory)
+        self.assertLess(requested_targets[3], self.domain.memory)
+        self.assertEqual(requested_targets[3], requested_targets[4])
 
     def test_virtio_mem_statistics_use_current_device_memory(self):
         self.controller.vm_backends["guest-a"] = {
@@ -448,14 +452,14 @@ class AdaptiveControllerTests(unittest.TestCase):
 
     def test_reclaim_scales_with_pressure_and_idle_ratio_and_is_capped(self):
         reductions = []
-        for pressure, expected in ((0, 0), (0.5, 47188), (1, 94372)):
+        for pressure, expected in ((0, 0), (0.5, 31460), (1, 62916)):
             with self.subTest(pressure=pressure):
                 self.domain = Domain()
                 self.controller.control_samples.clear()
                 self.controller.memory_targets.clear()
                 self.controller.pending_targets.clear()
                 self.domain.memory = 4194304
-                self.domain.usable = 3145728
+                self.domain.usable = 2097152
                 self.step(pressure=pressure)
                 reduction = 4194304 - self.domain.memory
                 self.assertLessEqual(reduction, 4194304 * 0.03)
@@ -463,6 +467,58 @@ class AdaptiveControllerTests(unittest.TestCase):
                 reductions.append(reduction)
         self.assertEqual(reductions[0], 0)
         self.assertLess(reductions[1], reductions[2])
+
+    def test_large_surplus_enables_reclaim_without_host_pressure(self):
+        actual = 4194300
+        reserve = 524288
+        threshold = actual * 13 // 20
+        for surplus, pressure in (
+                (threshold - 4096, 0), (threshold, 0),
+                (threshold + 4096, 0), (threshold + 4096, 0.25)):
+            with self.subTest(surplus=surplus, pressure=pressure):
+                reductions = []
+                for current_pressure in (pressure, 1):
+                    self.domain = Domain()
+                    self.domain.memory = actual
+                    self.domain.usable = reserve + surplus
+                    self.controller.control_samples.clear()
+                    self.controller.memory_targets.clear()
+                    self.controller.pending_targets.clear()
+                    self.step(pressure=current_pressure)
+                    reductions.append(actual - self.domain.memory)
+                if surplus > threshold:
+                    self.assertGreater(reductions[0], 0)
+                    self.assertEqual(reductions[0], reductions[1])
+                    self.assertLessEqual(reductions[0], surplus)
+                else:
+                    self.assertEqual(reductions[0], 0)
+                    self.assertGreater(reductions[1], 0)
+
+    def test_large_surplus_threshold_uses_proportional_reserve(self):
+        self.controller.config["default"]["keep_free_ratio"] = 0.3
+        self.domain.memory, self.domain.usable = 4194304, 3145728
+        self.step(pressure=0)
+        self.assertEqual(self.domain.memory, 4194304)
+
+    def test_idle_reclaim_threshold_inherits_and_can_be_overridden(self):
+        for default, override, reclaims in (
+                (0, None, True), (0.25, None, True), (0.375, None, False),
+                (1, None, False), (0.25, 0.5, False), (0.5, 0.25, True)):
+            with self.subTest(default=default, override=override):
+                self.controller.config["default"]["idle_reclaim_threshold"] = default
+                vm = self.controller.config["vms"][0]
+                if override is None:
+                    vm.pop("idle_reclaim_threshold", None)
+                else:
+                    vm["idle_reclaim_threshold"] = override
+                self.controller._LibVirtAutoReclaim__validate_config_parameters(self.controller.config)
+                self.domain = Domain()
+                self.domain.memory, self.domain.usable = 4194304, 2097152
+                self.controller.control_samples.clear()
+                self.controller.memory_targets.clear()
+                self.controller.pending_targets.clear()
+                self.step(pressure=0)
+                self.assertEqual(self.domain.memory < 4194304, reclaims)
 
     def test_memory_weight_scales_reclaim_with_a_twofold_cap(self):
         self.controller.config["default"]["memory_weight"] = 500
@@ -507,11 +563,12 @@ class AdaptiveControllerTests(unittest.TestCase):
         for elapsed, expected in ((1, 47188), (2, 94372), (5, 235932)):
             with self.subTest(elapsed=elapsed):
                 self.domain = Domain()
-                self.domain.memory, self.domain.usable = 4194304, 3145728
+                self.domain.memory, self.domain.usable = 4194304, 2097152
                 self.controller.control_samples.clear()
                 self.controller.memory_targets.clear()
                 self.controller.pending_targets.clear()
                 self.step(pressure=0)
+                self.domain.usable = 3145728
                 self.step(seconds=elapsed)
                 self.assertEqual(4194304 - self.domain.memory, expected)
 
@@ -885,6 +942,7 @@ class AdaptiveControllerTests(unittest.TestCase):
                     self.assertEqual(self.controller.host_memory_pressure(), expected)
 
     def test_bad_host_stats_disable_reclaim_but_allow_growth(self):
+        self.controller.config["default"]["idle_reclaim_threshold"] = 0
         for psi in ("full avg10=1\n", "some avg10=nan\n", "some avg10=-1\n",
                     "some avg10=101\n", "some avg10=broken\n", OSError("PSI unavailable")):
             with self.subTest(psi=psi):
@@ -898,8 +956,15 @@ class AdaptiveControllerTests(unittest.TestCase):
                 with patch("builtins.open", side_effect=open_stats):
                     with self.assertLogs(level="ERROR") as logs:
                         pressure = self.controller.host_memory_pressure()
-                    self.assertEqual(pressure, 0)
+                    self.assertEqual(pressure, autoreclaim.HOST_PRESSURE_UNAVAILABLE)
                     self.assertIn("reclaim disabled", logs.output[0])
+                    self.domain = Domain()
+                    self.domain.memory, self.domain.usable = 4194304, 3145728
+                    self.controller.control_samples.clear()
+                    self.controller.memory_targets.clear()
+                    self.controller.pending_targets.clear()
+                    self.step(pressure=pressure)
+                    self.assertEqual(self.domain.memory, 4194304)
                     self.domain = Domain()
                     self.domain.usable = 100000
                     self.controller.control_samples.clear()
@@ -911,7 +976,8 @@ class AdaptiveControllerTests(unittest.TestCase):
                         "MemTotal:\n", "MemTotal: 0 kB\nMemAvailable: 0 kB\n"):
             with self.subTest(content=content):
                 with patch("builtins.open", mock_open(read_data=content)), self.assertLogs(level="ERROR"):
-                    self.assertEqual(self.controller.host_memory_pressure(), 0)
+                    self.assertEqual(
+                        self.controller.host_memory_pressure(), autoreclaim.HOST_PRESSURE_UNAVAILABLE)
 
     def test_poll_reads_host_once_and_prioritizes_idle_guests(self):
         idle = Domain("guest-idle")
@@ -974,6 +1040,7 @@ class AdaptiveControllerTests(unittest.TestCase):
         for key, values in {
                 "ewma_alpha": (0, -0.1, 1.1, True, None, float("nan")),
                 "keep_free_ratio": (-0.1, 1.1, "0.1"),
+                "idle_reclaim_threshold": (-0.1, 1.1, True, None, "0.5", float("nan"), float("inf")),
                 "reclaim_ratio": (0, 0.051),
                 "pd_kp": (0, float("inf")),
                 "pd_kd": (-1, 11),
@@ -986,6 +1053,13 @@ class AdaptiveControllerTests(unittest.TestCase):
                     config = {scope: {key: value}, "vms": []}
                     with self.assertRaises(autoreclaim.ExitFailure):
                         self.controller._LibVirtAutoReclaim__validate_config_parameters(config)
+
+    def test_idle_reclaim_threshold_rejects_invalid_vm_values(self):
+        for value in (-0.1, 1.1, True, None, "0.5", float("nan")):
+            with self.subTest(value=value):
+                config = {"vms": [{"name": "guest-a", "idle_reclaim_threshold": value}]}
+                with self.assertRaisesRegex(autoreclaim.ExitFailure, "idle_reclaim_threshold"):
+                    self.controller._LibVirtAutoReclaim__validate_config_parameters(config)
 
     def test_host_pressure_settings_are_only_accepted_in_general(self):
         for key in ("psi_threshold", "host_min_free_ratio"):

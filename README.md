@@ -110,6 +110,7 @@ values. If `auto_reclaim` is omitted from both places, it defaults to `false`.
     "memory_weight": 100,
     "keep_free_kb": 524288,
     "keep_free_ratio": 0.1,
+    "idle_reclaim_threshold": 0.65,
     "ewma_alpha": 0.3,
     "reclaim_ratio": 0.015,
     "pd_kp": 0.5,
@@ -138,6 +139,7 @@ The following finite numeric settings can also be overridden per VM:
 | Setting | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `keep_free_ratio` | `0.1` | 0 to 1 | Proportional usable-memory reserve |
+| `idle_reclaim_threshold` | `0.65` | 0 to 1 | Surplus fraction of current RAM above which reclaim uses full pressure |
 | `ewma_alpha` | `0.3` | Greater than 0, at most 1 | Weight of the newest working-set sample |
 | `reclaim_ratio` | `0.015` | Greater than 0, at most 0.05 | Base fraction of current RAM reclaimed per second, before weight scaling |
 | `pd_kp` | `0.5` | Greater than 0, at most 1 | Proportional gain |
@@ -431,9 +433,15 @@ Pressure = max(min(avg10 / psi_threshold, 1),
 ```
 
 With the default settings, zero PSI and at least 20% host RAM available prevent
-all reclaim.
-Reclaim increases continuously as available RAM falls below that safety buffer,
-or PSI rises toward 5%. Both thresholds are configurable in `general`.
+reclaim unless `usable - Reserve` is strictly greater than
+`actual * idle_reclaim_threshold` (65% by default). Set this threshold in
+`default` or per VM; 0 enables the pressure override for any positive surplus,
+while 1 disables it. Above the threshold, the reclaim calculation uses full
+pressure even when the host is not under pressure. The usual reclaim rate,
+reserve, floor, and grace-period limits still apply. Otherwise, reclaim
+increases continuously as available RAM
+falls below that safety buffer, or PSI rises toward 5%. Both thresholds are
+configurable in `general`.
 An `avg10` value of `5` means 5%, not a fraction.
 
 VMs are processed in descending yield score:
@@ -455,6 +463,9 @@ surplus, and:
 actual * reclaim_ratio * Elapsed * Pressure * idle_ratio * min(2.0, 100.0 / memory_weight)
 ```
 
+For a guest whose instantaneous `usable - Reserve` exceeds
+`actual * idle_reclaim_threshold`, `Pressure` in this limit is 1 instead of
+the host pressure factor.
 `Elapsed` is the time in seconds between this VM's fresh guest-statistics
 samples, bounded below by one second. The first sample uses the VM's XML stats
 period. This keeps the base reclaim rate independent of the polling interval

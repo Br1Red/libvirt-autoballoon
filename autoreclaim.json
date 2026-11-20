@@ -8,6 +8,7 @@
 		"memory_weight": 100,
 		"keep_free_kb": 524288,
 		"keep_free_ratio": 0.1,
+		"idle_reclaim_threshold": 0.65,
 		"ewma_alpha": 0.3,
 		"reclaim_ratio": 0.015,
 		"pd_kp": 0.5,

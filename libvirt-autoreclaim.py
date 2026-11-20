@@ -17,6 +17,7 @@ SZ_4KiB = 4
 SZ_1MiB = 1024
 SZ_256MiB = 256 * 1024
 SZ_512MiB = 512 * 1024
+HOST_PRESSURE_UNAVAILABLE = -1.0
 
 UNIT_MULTIPLIERS = {
     "b": 1 / 1024.0,
@@ -139,6 +140,7 @@ class LibVirtAutoReclaim:
             bounds = {
                 "ewma_alpha": (0, 1, False),
                 "keep_free_ratio": (0, 1, True),
+                "idle_reclaim_threshold": (0, 1, True),
                 "reclaim_ratio": (0, 0.05, False),
                 "pd_kp": (0, 1, False),
                 "pd_kd": (0, 10, True),
@@ -459,6 +461,10 @@ class LibVirtAutoReclaim:
                 return
             if host_pressure is None:
                 host_pressure = self.host_memory_pressure()
+            if (host_pressure != HOST_PRESSURE_UNAVAILABLE
+                    and usable - reserve > actual * parameters.get("idle_reclaim_threshold", 0.65)):
+                host_pressure = 1.0
+            host_pressure = max(0.0, host_pressure)
             idle_ratio = usable / actual
             weight_multiplier = min(2.0, 100.0 / parameters.get("memory_weight", 100))
             reclaim_limit = (
@@ -507,7 +513,7 @@ class LibVirtAutoReclaim:
                 raise ExitFailure("Invalid or missing some avg10 in /proc/pressure/memory")
         except (OSError, ValueError, IndexError, ExitFailure) as error:
             logging.error("Cannot read host memory pressure; reclaim disabled for this cycle: %s", error)
-            return 0.0
+            return HOST_PRESSURE_UNAVAILABLE
         parameters = self.config.get("general", {})
         psi_threshold = parameters.get("psi_threshold", 5)
         host_min_free_ratio = parameters.get("host_min_free_ratio", 0.2)
