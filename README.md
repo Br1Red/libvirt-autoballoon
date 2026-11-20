@@ -490,15 +490,18 @@ The derivative term can brake reclaim but cannot turn it into growth while
 the smoothed reserve is satisfied, unless an emergency growth signal is present.
 
 Growth bypasses EWMA smoothing if instantaneous usable memory is below the
-reserve, used memory grows faster than 5% of current RAM per second, guest
-memory PSI `full avg10` exceeds 1%, or guest `SwapFree` falls faster than
-10 MiB/s between samples.
+reserve, used memory grows faster than 5% of current RAM per second, or guest
+`SwapFree` falls faster than 10 MiB/s between samples. Guest memory PSI
+`full avg10` above 1% also triggers emergency growth, but only when
+instantaneous usable memory is below twice the effective reserve.
 The controller requests at least 25% of current RAM, or enough to cover the
 reserve deficit and another polling interval of positive consumption trend,
 whichever is larger. Ordinary positive PD corrections are capped at 50% of
-current RAM per sample. Guest memory PSI `some avg10` above 10% forces an
-ordinary growth request of at least 10% of current RAM instead of allowing a
-negative PD correction. All requests are capped at the VM's maximum memory.
+current RAM per sample. Below the same headroom threshold, guest memory PSI
+`some avg10` above 10% forces an ordinary growth request of at least 10% of
+current RAM instead of allowing a negative PD correction. At or above twice
+the reserve, lingering PSI after a resize cannot trigger further growth on
+its own. All requests are capped at the VM's maximum memory.
 Progress toward an outstanding growth request does not trigger manual-increase
 grace periods. Ordinary adjustments wait until the previous memory request
 completes, rather than reversing or replacing a request still in flight.
@@ -576,8 +579,10 @@ For example, idle ratio 0.4 with weight 50 scores 0.8, ahead of idle ratio
 0.6 with weight 200, which scores 0.3. Zero idle memory scores zero regardless
 of weight.
 
-Guest memory PSI `some avg10` above 2%, any positive `full avg10`, or any drop in
-`SwapFree` since the previous sample vetoes reclaim, including idle reclaim.
+Guest memory PSI `some avg10` above 2%, `full avg10` above 0.1%, or active
+swapping vetoes reclaim, including idle reclaim. Swapping counts as active when
+`SwapFree` dropped by at least 256 KiB since the previous sample **and** at more
+than 64 KiB/s; smaller or slower drops are treated as noise.
 When `some avg10` is above 0.5% and at most 2%, the reclaim rate is multiplied by
 `1 - some_avg10 / 2.0`. Missing guest metrics are not treated as pressure
 signals; the other available limits still apply.
@@ -612,6 +617,17 @@ the daemon retries host statistics on the next cycle.
 SIGTERM (including `systemctl stop`) removes the polling timer, deregisters
 lifecycle callbacks, and closes the libvirt connection before exiting with
 status 143, which the supplied systemd unit treats as a successful shutdown.
+Ctrl+C (SIGINT) performs the same cleanup and exits with status 130 without a
+traceback.
+If the libvirt connection is lost (for example, `client socket is closed`
+after `virtqemud` restarts), the daemon deregisters its callbacks, closes the
+stale connection (ignoring cleanup errors), and reconnects automatically with
+exponential backoff: 1, 2, 4, … seconds, capped at 60 seconds. After
+reconnecting, it registers its callbacks again and rediscovers the running
+domains, because lifecycle events may have been missed. The backoff resets
+after the first successful poll. A failure of the libvirt event loop itself is
+still fatal; the supplied systemd unit uses `Restart=always` to start a new
+process.
 
 # Installation
 

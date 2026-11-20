@@ -338,15 +338,17 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertEqual(self.domain.calls, [5242880])
 
     def test_guest_psi_overrides_negative_pd_and_controls_reclaim(self):
-        for some, full, expected in (
-                ("0.50", "0.00", 4131388), ("1.00", "0.00", 4162844),
-                ("2.00", "0.00", None), ("2.01", "0.00", None),
-                ("0.00", "0.01", None), ("0.00", "1.00", None),
-                ("0.00", "1.01", 5242880), ("10.00", "0.00", None),
-                ("10.01", "0.00", 4613732), ("nan", "bad", 4131388)):
-            with self.subTest(some=some, full=full):
+        for some, full, usable, expected in (
+                ("0.50", "0.00", 2097152, 4131388), ("1.00", "0.00", 2097152, 4162844),
+                ("2.00", "0.00", 2097152, None), ("2.01", "0.00", 2097152, None),
+                ("0.00", "0.10", 2097152, 4131388), ("0.00", "0.11", 2097152, None),
+                ("0.00", "1.00", 1000000, None), ("0.00", "1.01", 1000000, 5242880),
+                ("0.00", "1.01", 1048576, None), ("2.19", "1.19", 3334820, None),
+                ("10.00", "0.00", 1000000, None), ("10.01", "0.00", 1000000, 4613732),
+                ("10.01", "0.00", 2097152, None), ("nan", "bad", 2097152, 4131388)):
+            with self.subTest(some=some, full=full, usable=usable):
                 self.domain = Domain()
-                self.domain.memory, self.domain.usable = 4194304, 2097152
+                self.domain.memory, self.domain.usable = 4194304, usable
                 self.controller.memory_targets.clear()
                 self.controller.pending_targets.clear()
                 self.controller.control_samples.clear()
@@ -359,7 +361,8 @@ class AdaptiveControllerTests(unittest.TestCase):
 
     def test_guest_swap_drop_veto_and_emergency_use_elapsed_sample_time(self):
         for drop, elapsed, expected in (
-                (1, 2, None), (20480, 2, None), (20481, 2, 5242880),
+                (1, 2, 4131388), (255, 2, 4131388), (256, 2, None), (256, 4, 4068472),
+                (20480, 2, None), (20481, 2, 5242880),
                 (20481, 4, None), (-1, 2, 4131388)):
             with self.subTest(drop=drop, elapsed=elapsed):
                 self.domain = Domain()
@@ -1391,7 +1394,7 @@ class LifecycleTests(unittest.TestCase):
                                     ["libvirt-autoreclaim"] + (["--debug"] if debug else []) + [action])
                         finally:
                             root.setLevel(previous_level)
-                        self.assertIn("unavailable", output.getvalue().splitlines()[1].split())
+                        self.assertIn("unavailable/read-only", output.getvalue().splitlines()[1].split())
                         self.assertIn("Unrelated libvirt failure", errors.getvalue())
                         self.assertEqual(errors.getvalue().count("Guest agent unavailable"), int(debug))
                         self.libvirt.registerErrorHandler.assert_called_with(None, None)
@@ -1813,6 +1816,54 @@ class LifecycleTests(unittest.TestCase):
             self.controller.daemon()
         self.libvirt.virEventRemoveTimeout.assert_called_once_with(7)
         self.conn.domainEventDeregisterAny.assert_called_once_with(3)
+
+    def test_closed_socket_attempts_all_cleanup_before_reconnecting(self):
+        self.libvirt.VIR_DOMAIN_EVENT_ID_MEMORY_DEVICE_SIZE_CHANGE = 9
+        self.conn.domainEventRegisterAny.side_effect = [3, 4]
+        self.conn.listDomainsID.side_effect = self.libvirt.libvirtError("client socket is closed")
+        self.libvirt.virEventRemoveTimeout.side_effect = self.libvirt.libvirtError("timer removal failed")
+        self.conn.domainEventDeregisterAny.side_effect = self.libvirt.libvirtError("deregistration failed")
+        self.conn.close.side_effect = self.libvirt.libvirtError("close failed")
+
+        with patch.object(autoreclaim, "LibVirtAutoReclaim", return_value=self.controller):
+            with patch.object(autoreclaim, "sleep", side_effect=KeyboardInterrupt) as sleep:
+                with self.assertRaises(SystemExit) as stopped:
+                    autoreclaim.libvirt_autoreclaim(["libvirt-autoreclaim", "start"])
+
+        self.assertEqual(stopped.exception.code, 130)
+        self.assertTrue(stopped.exception.__suppress_context__)
+        sleep.assert_called_once_with(1)
+        self.libvirt.virEventRemoveTimeout.assert_called_once_with(7)
+        self.assertIsNone(self.controller.timer_id)
+        self.assertEqual([call.args for call in self.conn.domainEventDeregisterAny.call_args_list],
+                         [(3,), (4,)])
+        self.conn.close.assert_called_once_with()
+        self.assertIsNone(self.controller.conn)
+
+    def test_daemon_reconnects_with_backoff_and_rediscovers_domains(self):
+        self.conn.domainEventRegisterAny.return_value = 3
+        self.conn.listDomainsID.side_effect = self.libvirt.libvirtError("client socket is closed")
+        new_conn = Mock()
+        new_conn.domainEventRegisterAny.return_value = 5
+        new_conn.listAllDomains.return_value = []
+        new_conn.listDomainsID.return_value = []
+        self.libvirt.open.side_effect = [None, self.libvirt.libvirtError("refused"), new_conn]
+        self.libvirt.virEventRunDefaultImpl.side_effect = KeyboardInterrupt
+
+        with patch.object(autoreclaim, "sleep") as sleep:
+            with self.assertRaises(KeyboardInterrupt):
+                self.controller.daemon()
+
+        self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (2,), (4,)])
+        self.assertEqual(self.libvirt.open.call_count, 4)
+        self.libvirt.open.assert_called_with("qemu:///system")
+        self.conn.close.assert_called_once_with()
+        self.assertIs(self.controller.conn, new_conn)
+        new_conn.listAllDomains.assert_called_once()
+        new_conn.listDomainsID.assert_called_once_with()
+        new_conn.domainEventDeregisterAny.assert_called_once_with(5)
+        self.assertEqual(self.controller.reconnect_delay, 1)
+        self.libvirt.virEventAddTimeout.assert_called_once()
 
     def test_cli_closes_connection_on_failure(self):
         with patch.object(autoreclaim, "LibVirtAutoReclaim", return_value=self.controller):

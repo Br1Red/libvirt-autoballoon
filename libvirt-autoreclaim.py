@@ -10,7 +10,7 @@ import signal
 import xml.etree.ElementTree as ET
 import libvirt
 
-from time import monotonic, time
+from time import monotonic, sleep, time
 from typing import NamedTuple, Optional
 
 SZ_4KiB = 4
@@ -18,7 +18,10 @@ SZ_1MiB = 1024
 SZ_256MiB = 256 * 1024
 SZ_512MiB = 512 * 1024
 HOST_PRESSURE_UNAVAILABLE = -1.0
+RECONNECT_MAX_DELAY = 60
 GUEST_SWAP_EMERGENCY_KIB_PER_SEC = 10 * SZ_1MiB
+GUEST_SWAP_VETO_KIB_PER_SEC = 64
+GUEST_SWAP_VETO_MIN_DROP_KIB = 256
 GUEST_MEMINFO_FIELDS = {
     "MemTotal": "actual",
     "MemAvailable": "usable",
@@ -71,6 +74,12 @@ class MemorySample(NamedTuple):
 class ExitFailure(Exception):
     pass
 
+def cleanup_libvirt(operation, *args):
+    try:
+        operation(*args)
+    except libvirt.libvirtError as error:
+        logging.debug("Libvirt cleanup failed: %s", error)
+
 class LogFormatter(logging.Formatter):
     def formatMessage(self, record):
         if record.levelno == logging.INFO:
@@ -84,6 +93,7 @@ class LibVirtAutoReclaim:
 
     def __init__(self, qemu_addr='qemu:///system', configfile='/etc/libvirt/autoreclaim.json'):
         self.configfile = configfile
+        self.qemu_addr = qemu_addr
         self.monitored_vms = set()
         self.guest_agents = set()
         self.read_only_vms = set()
@@ -102,7 +112,7 @@ class LibVirtAutoReclaim:
         try:
             self.__load_config()
         except (OSError, ValueError, KeyError, ExitFailure, KeyboardInterrupt, SystemExit):
-            self.conn.close()
+            cleanup_libvirt(self.conn.close)
             raise
 
     def __load_config(self):
@@ -539,13 +549,14 @@ class LibVirtAutoReclaim:
         emergency = (usable < reserve or used_rate > actual * 0.05
                      or swap_rate > GUEST_SWAP_EMERGENCY_KIB_PER_SEC)
         psi_some = psi_full = None
-        if source == "guest-agent" and (usable < 2 * reserve or delta < 0):
+        low_headroom = usable < 2 * reserve
+        if source == "guest-agent" and (low_headroom or delta < 0):
             psi_some, psi_full = self._get_guest_agent_memory_pressure(dom)
-        emergency = emergency or (psi_full is not None and psi_full > 1.0)
+        emergency = emergency or (low_headroom and psi_full is not None and psi_full > 1.0)
         if emergency:
             delta = max(delta, reserve - usable + max(0, used_rate) * self.poll_interval,
                         actual * 0.25)
-        elif psi_some is not None and psi_some > 10.0:
+        elif low_headroom and psi_some is not None and psi_some > 10.0:
             delta = min(actual * 0.5, max(delta, actual * 0.1))
         elif error <= 0:
             delta = min(delta, 0)
@@ -569,7 +580,9 @@ class LibVirtAutoReclaim:
                 actual * parameters.get("reclaim_ratio", 0.015) * elapsed * host_pressure * idle_ratio
                 * weight_multiplier)
             guest_factor = 1.0
-            if (swap_drop > 0 or (psi_full is not None and psi_full > 0)
+            swap_active = (swap_drop >= GUEST_SWAP_VETO_MIN_DROP_KIB
+                           and swap_rate > GUEST_SWAP_VETO_KIB_PER_SEC)
+            if (swap_active or (psi_full is not None and psi_full > 0.1)
                     or (psi_some is not None and psi_some > 2.0)):
                 guest_factor = 0.0
             elif psi_some is not None and psi_some > 0.5:
@@ -845,34 +858,61 @@ class LibVirtAutoReclaim:
 
     def daemon(self):
         print("Starting daemon", flush=True)
-        callback_id = self.conn.domainEventRegisterAny(
-            None, libvirt.VIR_DOMAIN_EVENT_ID_LIFECYCLE, self.__domain_lifecycle, None)
-        memdev_callback_id = None
+        self.reconnect_delay = 1
         try:
+            while True:
+                try:
+                    if self.conn is None:
+                        self.__reconnect()
+                    self.__run_connection()
+                except libvirt.libvirtError as error:
+                    if self.conn is not None:
+                        cleanup_libvirt(self.conn.close)
+                        self.conn = None
+                    logging.error("Libvirt connection failed: %s; reconnecting in %s seconds",
+                                  error, self.reconnect_delay)
+                    sleep(self.reconnect_delay)
+                    self.reconnect_delay = min(RECONNECT_MAX_DELAY, self.reconnect_delay * 2)
+        finally:
+            if self.timer_id is not None:
+                cleanup_libvirt(libvirt.virEventRemoveTimeout, self.timer_id)
+                self.timer_id = None
+
+    def __reconnect(self):
+        conn = libvirt.open(self.qemu_addr)
+        if conn is None:
+            raise libvirt.libvirtError("Failed to reopen connection to the hypervisor")
+        self.conn = conn
+        logging.info("Reconnected to libvirt at %s", self.qemu_addr)
+
+    def __run_connection(self):
+        callback_ids = []
+        try:
+            callback_ids.append(self.conn.domainEventRegisterAny(
+                None, libvirt.VIR_DOMAIN_EVENT_ID_LIFECYCLE, self.__domain_lifecycle, None))
             if hasattr(libvirt, "VIR_DOMAIN_EVENT_ID_MEMORY_DEVICE_SIZE_CHANGE"):
-                memdev_callback_id = self.conn.domainEventRegisterAny(
+                callback_ids.append(self.conn.domainEventRegisterAny(
                     None,
                     libvirt.VIR_DOMAIN_EVENT_ID_MEMORY_DEVICE_SIZE_CHANGE,
                     self.__memory_device_size_change,
                     None,
-                )
+                ))
+            # Lifecycle events may have been missed while disconnected.
             self.dom_print_names()
             self.poll_due = True
-            self.timer_id = libvirt.virEventAddTimeout(
-                self.poll_interval * 1000, self.__poll_timeout, None)
+            if self.timer_id is None:
+                self.timer_id = libvirt.virEventAddTimeout(
+                    self.poll_interval * 1000, self.__poll_timeout, None)
             while True:
                 if self.poll_due:
                     self.poll_due = False
                     self.process_domains()
+                    self.reconnect_delay = 1
                 if libvirt.virEventRunDefaultImpl() < 0:
                     raise ExitFailure("Libvirt event loop failed")
         finally:
-            if self.timer_id is not None:
-                libvirt.virEventRemoveTimeout(self.timer_id)
-                self.timer_id = None
-            self.conn.domainEventDeregisterAny(callback_id)
-            if memdev_callback_id is not None:
-                self.conn.domainEventDeregisterAny(memdev_callback_id)
+            for callback_id in callback_ids:
+                cleanup_libvirt(self.conn.domainEventDeregisterAny, callback_id)
 
 def dom_balloon(dom, restrict_to, actual, total_ram):
     name = dom.name()
@@ -1035,7 +1075,10 @@ def libvirt_autoreclaim(argv):
             elif args.action == "status":
                 lv_ctrl.status()
         finally:
-            lv_ctrl.conn.close()
+            if lv_ctrl.conn is not None:
+                cleanup_libvirt(lv_ctrl.conn.close)
+    except KeyboardInterrupt:
+        raise SystemExit(128 + signal.SIGINT) from None
     finally:
         libvirt.registerErrorHandler(None, None)
         signal.signal(signal.SIGTERM, previous_sigterm)
