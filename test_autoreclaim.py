@@ -126,6 +126,21 @@ class VirtioMemAdjustmentTests(unittest.TestCase):
         self.assertEqual(updated_device.findtext("./target/requested"), "1048576")
         self.assertIsNone(updated_device.find("./target/current"))
 
+    def test_dom_virtio_mem_block_rounding_does_not_cross_guest_floor(self):
+        domain = Mock()
+        domain.XMLDesc.return_value = (
+            "<domain><memory unit='KiB'>3145728</memory><devices>"
+            "<memory model='virtio-mem'><target><size>2097152</size><block>262144</block>"
+            "<requested>1048576</requested><current>1048576</current>"
+            "</target></memory></devices></domain>")
+        with patch.object(autoreclaim.libvirt, "VIR_DOMAIN_AFFECT_LIVE", 1, create=True):
+            requested = autoreclaim.dom_virtio_mem(
+                domain, 1350000, 2097152, minimum_ram_kb=1350000)
+
+        self.assertEqual(requested, 1572864)
+        device_xml = domain.updateDeviceFlags.call_args.args[0]
+        self.assertEqual(autoreclaim.ET.fromstring(device_xml).findtext("./target/requested"), "524288")
+
 
 class AdaptiveControllerTests(unittest.TestCase):
     def setUp(self):
@@ -173,22 +188,23 @@ class AdaptiveControllerTests(unittest.TestCase):
                 with patch.object(self.controller, "dom_print_names"), redirect_stdout(output):
                     self.controller.status()
                 self.assertEqual([line.split() for line in output.getvalue().splitlines()], [
-                    ["Domain", "Stats_Source", "Memory_Method", "Total", "Actual", "Used",
-                     "Usable", "Keep_Usable", "Weight", "Units"],
-                    ["guest-a", "balloon", "balloon", "8192", "1024", "512", "512", "512",
-                     str(expected), "MiB"],
+                    ["Domain", "Backend", "Total", "Actual", "Used",
+                     "Usable", "Keep_Usable", "Weight", "Floor", "PSI", "Swap_Used"],
+                    ["guest-a", "balloon", "8192", "1024", "512", "512", "512",
+                     str(expected), "1137", "n/a", "n/a"],
                 ])
 
-    def test_status_shows_statistics_source_and_memory_method(self):
+    def test_status_combines_statistics_source_and_memory_method(self):
         self.controller.conn = Mock()
         self.controller.conn.listDomainsID.return_value = [1]
         self.controller.conn.lookupByID.return_value = self.domain
 
-        for backend, read_only, stats_source, expected_method in (
+        for backend, read_only, stats_source, expected_backend in (
                 ("balloon", False, "balloon", "balloon"),
-                ("virtio-mem", False, "guest-agent", "virtio-mem"),
-                ("balloon", True, "guest-agent", "read-only")):
-            with self.subTest(backend=backend, read_only=read_only):
+                ("virtio-mem", False, "guest-agent", "agent/virtio-mem"),
+                ("balloon", True, "guest-agent", "agent/read-only"),
+                ("balloon", True, "unavailable", "unavailable/read-only")):
+            with self.subTest(backend=backend, read_only=read_only, source=stats_source):
                 self.controller.vm_backends["guest-a"] = {"type": backend}
                 if read_only:
                     self.controller.read_only_vms.add("guest-a")
@@ -199,11 +215,14 @@ class AdaptiveControllerTests(unittest.TestCase):
                         "usable": self.domain.usable,
                         "source": stats_source}):
                     output = io.StringIO()
-                    with patch.object(self.controller, "dom_print_names"), redirect_stdout(output):
+                    with patch.object(self.controller, "dom_print_names"), \
+                            patch.object(self.controller, "_inspect_virtio_mem_devices", return_value=None), \
+                            patch.object(self.controller, "_get_guest_agent_memory_pressure",
+                                         return_value=(None, None)), redirect_stdout(output):
                         self.controller.status()
 
                 row = output.getvalue().splitlines()[1].split()
-                self.assertEqual(row[1:3], [stats_source, expected_method])
+                self.assertEqual(row[1], expected_backend)
 
     def test_status_aligns_columns_for_long_names_and_large_numbers(self):
         long_domain = Domain("Windows11Professional-Lavoro")
@@ -221,7 +240,8 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertEqual(lines[1].index("8192"), lines[2].index("1048576") + 3)
         self.assertEqual(lines[0].index("Total") + 5, lines[2].index("1048576") + 7)
         for line in lines[1:]:
-            self.assertEqual(line.index("MiB"), lines[0].index("Units"))
+            self.assertTrue(line.endswith("n/a"))
+            self.assertEqual(len(line), len(lines[0]))
         self.assertTrue(lines[2].startswith(long_domain.name() + "  "))
 
     def test_status_with_no_active_domains_prints_only_header(self):
@@ -232,12 +252,36 @@ class AdaptiveControllerTests(unittest.TestCase):
             self.controller.status()
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertEqual(output.getvalue().split(), [
-            "Domain", "Stats_Source", "Memory_Method", "Total", "Actual", "Used",
-            "Usable", "Keep_Usable", "Weight", "Units",
+            "Domain", "Backend", "Total", "Actual", "Used",
+            "Usable", "Keep_Usable", "Weight", "Floor", "PSI", "Swap_Used",
         ])
 
+    def test_status_shows_guest_reclaim_floor_psi_and_swap(self):
+        stats = {"actual": 4194304, "usable": 2097152, "source": "guest-agent",
+                 "anon_pages": 2097152, "active_file": 524288, "inactive_file": 1048576,
+                 "swap_total": 524288, "swap_free": 393216}
+        with patch.object(self.controller, "_get_domain_memstats", return_value=stats), \
+                patch.object(self.controller, "_read_guest_agent_file",
+                             return_value="some avg10=0.40\nfull avg10=0.01\n") as read_file:
+            row = self.controller.dom_status(self.domain)
+        read_file.assert_called_once_with(self.domain, "/proc/pressure/memory")
+        self.assertEqual(row[-3:], ("3413", "0.4%", "128"))
+
+    def test_status_shows_virtio_mem_base_floor_without_guest_metrics(self):
+        self.controller.vm_backends["guest-a"] = {"type": "virtio-mem"}
+        stats = {"actual": 4194304, "usable": 2097152, "source": "balloon"}
+        with patch.object(self.controller, "_get_domain_memstats", return_value=stats), \
+                patch.object(self.controller, "_inspect_virtio_mem_devices", return_value={
+                    "base_ram_kb": 2097152, "max_ram_kb": 6291456}), \
+                patch.object(self.controller, "_get_guest_agent_memory_pressure") as psi:
+            row = self.controller.dom_status(self.domain)
+        psi.assert_not_called()
+        self.assertEqual(row[-3:], ("2048", "n/a", "n/a"))
+
     def test_guest_agent_meminfo_reads_and_closes_guest_file(self):
-        meminfo = "MemTotal: 1048576 kB\nMemAvailable: 524288 kB\n"
+        meminfo = ("MemTotal: 1048576 kB\nMemAvailable: 524288 kB\nAnonPages: 300000 kB\n"
+                   "Active(file): 70000 kB\nInactive(file): 120000 kB\n"
+                   "SwapTotal: 200000 kB\nSwapFree: 150000 kB\n")
         response = json.dumps({
             "return": {
                 "buf-b64": base64.b64encode(meminfo.encode()).decode(),
@@ -264,27 +308,139 @@ class AdaptiveControllerTests(unittest.TestCase):
             "usable": 524288,
             "last_update": 100,
             "source": "guest-agent",
+            "sampled_at": 100,
+            "anon_pages": 300000,
+            "active_file": 70000,
+            "inactive_file": 120000,
+            "swap_total": 200000,
+            "swap_free": 150000,
         })
         self.assertEqual(commands, ["guest-file-open", "guest-file-read", "guest-file-close"])
 
-    def test_guest_agent_stats_fallback_drives_memory_growth(self):
+    def test_control_reads_guest_meminfo_once_and_only_reads_psi_on_demand(self):
+        self.controller.guest_agents.add("guest-a")
+        self.domain.memory = 4194304
+        self.controller.config["default"].update({"pd_kp": 0, "pd_kd": 0})
+        files = {
+            "/proc/meminfo": "MemTotal: 4194304 kB\nMemAvailable: 1100000 kB\n",
+            "/proc/pressure/memory": "some avg10=0.00\nfull avg10=1.01\n",
+        }
+        with patch.object(self.controller, "_read_guest_agent_file", side_effect=(
+                lambda dom, path: files[path])) as read_file:
+            self.step(pressure=0)
+            self.assertEqual([call.args[1] for call in read_file.call_args_list], ["/proc/meminfo"])
+            self.assertEqual(self.domain.calls, [])
+            read_file.reset_mock()
+            files["/proc/meminfo"] = "MemTotal: 4194304 kB\nMemAvailable: 1000000 kB\n"
+            self.step(pressure=0)
+            self.assertEqual([call.args[1] for call in read_file.call_args_list],
+                             ["/proc/meminfo", "/proc/pressure/memory"])
+        self.assertEqual(self.domain.calls, [5242880])
+
+    def test_guest_psi_overrides_negative_pd_and_controls_reclaim(self):
+        for some, full, expected in (
+                ("0.50", "0.00", 4131388), ("1.00", "0.00", 4162844),
+                ("2.00", "0.00", None), ("2.01", "0.00", None),
+                ("0.00", "0.01", None), ("0.00", "1.00", None),
+                ("0.00", "1.01", 5242880), ("10.00", "0.00", None),
+                ("10.01", "0.00", 4613732), ("nan", "bad", 4131388)):
+            with self.subTest(some=some, full=full):
+                self.domain = Domain()
+                self.domain.memory, self.domain.usable = 4194304, 2097152
+                self.controller.memory_targets.clear()
+                self.controller.pending_targets.clear()
+                self.controller.control_samples.clear()
+                stats = {**self.domain.memoryStats(), "last_update": self.now, "source": "guest-agent"}
+                with patch.object(self.controller, "_read_guest_agent_file", return_value=(
+                        f"some avg10={some} avg60=56.00\nfull avg10={full} avg60=12.00\n")) as read_file:
+                    self.controller.process_domainID(self.domain, 1, stats)
+                read_file.assert_called_once_with(self.domain, "/proc/pressure/memory")
+                self.assertEqual(self.domain.calls, [] if expected is None else [expected])
+
+    def test_guest_swap_drop_veto_and_emergency_use_elapsed_sample_time(self):
+        for drop, elapsed, expected in (
+                (1, 2, None), (20480, 2, None), (20481, 2, 5242880),
+                (20481, 4, None), (-1, 2, 4131388)):
+            with self.subTest(drop=drop, elapsed=elapsed):
+                self.domain = Domain()
+                self.domain.memory, self.domain.usable = 4194304, 2097152
+                self.controller.control_samples.clear()
+                self.controller.memory_targets.clear()
+                self.controller.pending_targets.clear()
+                stats = {**self.domain.memoryStats(), "source": "guest-agent",
+                         "last_update": self.now, "sampled_at": self.now,
+                         "swap_total": 131072, "swap_free": 65536}
+                with patch.object(self.controller, "_get_guest_agent_memory_pressure",
+                                  return_value=(None, None)):
+                    self.controller.process_domainID(self.domain, 0, stats)
+                    # The wall-clock sample spacing differs from the monotonic spacing.
+                    self.now += 2
+                    stats.update(last_update=self.now, sampled_at=stats["sampled_at"] + elapsed,
+                                 swap_free=65536 - drop)
+                    self.controller.process_domainID(self.domain, 1, stats)
+                self.assertEqual(self.domain.calls, [] if expected is None else [expected])
+
+    def test_guest_floor_limits_reclaim_without_protecting_inactive_cache(self):
+        self.domain.memory, self.domain.usable = 4194304, 2097152
+        # ceil((2500000 + 701001 + 524288) / 0.9), then page aligned upwards.
+        stats = {**self.domain.memoryStats(), "source": "guest-agent", "anon_pages": 2500000,
+                 "active_file": 701001, "inactive_file": 900000}
+        with patch.object(self.controller, "_get_guest_agent_memory_pressure", return_value=(0, 0)):
+            self.controller.process_domainID(self.domain, 1, stats)
+        self.assertEqual(self.domain.calls, [4139212])
+
+    def test_guest_floor_above_actual_does_not_cause_growth(self):
+        for some, kp in ((0, 0.5), (0, 0), (2, 0.5), (2.01, 0.5)):
+            with self.subTest(some=some, pd_kp=kp):
+                self.domain = Domain()
+                self.domain.memory, self.domain.usable = 8388608, 2097152
+                self.domain.maximum = 16777216
+                self.controller.control_samples.clear()
+                self.controller.memory_targets.clear()
+                self.controller.pending_targets.clear()
+                self.controller.config["default"]["pd_kp"] = kp
+                stats = {**self.domain.memoryStats(), "source": "guest-agent",
+                         "anon_pages": 1048576, "active_file": 6291456}
+                with patch.object(self.controller, "_get_guest_agent_memory_pressure", return_value=(some, 0)):
+                    self.controller.process_domainID(self.domain, 1, stats)
+                self.assertEqual(self.domain.calls, [])
+
+    def test_guest_reclaim_veto_does_not_request_growth_to_static_floor(self):
+        self.domain.usable = 655360
+        stats = {**self.domain.memoryStats(), "source": "guest-agent"}
+        with patch.object(self.controller, "_get_guest_agent_memory_pressure", return_value=(2, 0)):
+            self.controller.process_domainID(self.domain, 1, stats)
+        self.assertEqual(self.domain.calls, [])
+
+    def test_guest_agent_uses_monotonic_time_for_new_samples_and_swap_rate(self):
+        self.domain.memory, self.domain.usable = 4194304, 2097152
+        stats = {**self.domain.memoryStats(), "source": "guest-agent", "sampled_at": 100.1,
+                 "swap_total": 131072, "swap_free": 65536}
+        with patch.object(self.controller, "_get_guest_agent_memory_pressure", return_value=(0, 0)) as psi:
+            self.controller.process_domainID(self.domain, 0, stats)
+            self.controller.process_domainID(self.domain, 1, stats)
+            psi.assert_called_once()
+            self.assertEqual(self.domain.calls, [])
+            stats.update(sampled_at=100.6, swap_free=65536 - 5121)
+            self.controller.process_domainID(self.domain, 1, stats)
+        self.assertEqual(psi.call_count, 2)
+        self.assertEqual(self.domain.calls, [5242880])
+
+    def test_guest_agent_stats_drive_memory_growth(self):
         self.controller.guest_agents.add("guest-a")
         self.domain.usable = 100000
-        balloon_stats = {
-            "actual": self.domain.memory,
-            "usable": -1,
-            "last_update": self.now,
-        }
         guest_stats = {
             "actual": self.domain.memory,
             "usable": self.domain.usable,
             "last_update": self.now,
             "source": "guest-agent",
         }
-        with patch.object(self.domain, "memoryStats", return_value=balloon_stats):
-            with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats):
-                self.controller.process_domainID(self.domain, 0)
+        with patch.object(self.domain, "memoryStats") as memory_stats, \
+                patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats), \
+                patch.object(self.controller, "_read_guest_agent_file", return_value=None):
+            self.controller.process_domainID(self.domain, 0)
 
+        memory_stats.assert_not_called()
         self.assertGreater(self.domain.memory, 1048576)
 
     def test_virtio_mem_backend_uses_virtio_adjustments_not_balloon(self):
@@ -319,7 +475,7 @@ class AdaptiveControllerTests(unittest.TestCase):
         vmem_info = {"max_ram_kb": self.domain.maximum, "base_ram_kb": 1048576}
         requested_targets = []
 
-        def request_virtio_mem(domain, target, actual):
+        def request_virtio_mem(domain, target, actual, *, minimum_ram_kb=0):
             requested_targets.append(target)
             return target if target != actual else None
 
@@ -366,10 +522,10 @@ class AdaptiveControllerTests(unittest.TestCase):
             "source": "guest-agent",
         }
         with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats):
-            with patch.object(self.domain, "memoryStats", return_value={
-                    "actual": 0, "usable": -1, "last_update": 0}):
+            with patch.object(self.domain, "memoryStats") as memory_stats:
                 stats = self.controller._get_domain_memstats(self.domain)
 
+        memory_stats.assert_not_called()
         self.assertEqual(stats["actual"], 1572864)
         self.assertEqual(stats["usable"], 1572864)
         self.assertEqual(stats["source"], "guest-agent")
@@ -387,8 +543,8 @@ class AdaptiveControllerTests(unittest.TestCase):
                 "actual": 4325376, "usable": 2602964, "last_update": self.now}):
             row = self.controller.dom_status(self.domain)
 
-        self.assertEqual(row[:7], (
-            "guest-a", "balloon", "virtio-mem", "8192", "4224", "1682", "2541"))
+        self.assertEqual(row[:6], (
+            "guest-a", "balloon/virtio-mem", "8192", "4224", "1682", "2541"))
 
     def test_read_only_guest_agent_monitoring_does_not_change_memory(self):
         self.controller.read_only_vms.add("guest-a")
@@ -422,28 +578,34 @@ class AdaptiveControllerTests(unittest.TestCase):
         get_stats.assert_called_once_with(self.domain)
         memory_stats.assert_not_called()
 
-    def test_fresh_balloon_stats_do_not_query_guest_agent(self):
+    def test_status_uses_guest_agent_without_querying_fresh_balloon_stats(self):
         self.controller.guest_agents.add("guest-a")
-        with patch.object(self.controller, "_get_guest_agent_meminfo") as get_guest_stats:
-            stats = self.controller._get_domain_memstats(self.domain)
+        guest_stats = {"actual": 983040, "usable": 393216, "last_update": self.now,
+                       "source": "guest-agent"}
+        with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats), \
+                patch.object(self.controller, "_get_guest_agent_memory_pressure", return_value=(None, None)), \
+                patch.object(self.domain, "memoryStats", wraps=self.domain.memoryStats) as balloon:
+            row = self.controller.dom_status(self.domain)
 
-        self.assertEqual(stats["source"], "balloon")
-        get_guest_stats.assert_not_called()
+        balloon.assert_not_called()
+        self.assertEqual(row[:6], ("guest-a", "agent/balloon", "8192", "960", "576", "384"))
 
-    def test_stale_balloon_stats_fall_back_to_guest_agent(self):
+    def test_guest_agent_open_failure_falls_back_to_balloon_without_retrying_psi(self):
         self.controller.guest_agents.add("guest-a")
-        self.domain.updated = self.now - 16
-        guest_stats = {
-            "actual": self.domain.memory,
-            "usable": self.domain.usable,
-            "last_update": self.now,
-            "source": "guest-agent",
-        }
-        with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=guest_stats) as get_guest_stats:
-            stats = self.controller._get_domain_memstats(self.domain)
+        self.domain.memory, self.domain.usable = 4194304, 2097152
+        operations = Mock()
+        operations.agent.side_effect = autoreclaim.libvirt.libvirtError("cannot open /proc/meminfo")
+        operations.balloon.side_effect = self.domain.memoryStats
+        qemu_module = types.SimpleNamespace(qemuAgentCommand=operations.agent)
+        with patch.dict(sys.modules, {"libvirt_qemu": qemu_module}), \
+                patch.object(self.domain, "memoryStats", operations.balloon):
+            self.controller.process_domainID(self.domain, 1)
 
-        self.assertEqual(stats["source"], "guest-agent")
-        get_guest_stats.assert_called_once_with(self.domain)
+        self.assertEqual([call[0] for call in operations.mock_calls], ["agent", "balloon"])
+        self.assertEqual(json.loads(operations.agent.call_args.args[1])["arguments"]["path"],
+                         "/proc/meminfo")
+        self.assertEqual(self.controller.control_samples["guest-a"].source, "balloon")
+        self.assertEqual(self.domain.calls, [4131388])
 
     def test_no_change_at_reserve(self):
         self.domain.memory = 1310720
@@ -714,7 +876,7 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.domain.usable = 614400
         self.controller.config["default"].update({"ewma_alpha": 0.5, "pd_kd": 10})
         self.controller.control_samples["guest-a"] = autoreclaim.MemorySample(
-            1925120, 1925120, -131072, 99)
+            1925120, 1925120, -131072, 99, source="balloon")
         self.controller.process_domainID(self.domain, 1)
         self.assertEqual(self.domain.calls, [2097152 + 196608])
 
@@ -997,6 +1159,30 @@ class AdaptiveControllerTests(unittest.TestCase):
                          ["guest-idle", "guest-a", "guest-busy"])
         self.assertTrue(all(call.args[1] == 0.5 for call in process.call_args_list))
 
+    def test_read_only_guest_is_sampled_by_status_but_not_by_polling(self):
+        self.controller.read_only_vms.add("guest-a")
+        self.controller.conn = Mock()
+        self.controller.conn.listDomainsID.return_value = [1]
+        self.controller.conn.lookupByID.return_value = self.domain
+        stats = {"actual": self.domain.memory, "usable": self.domain.usable,
+                 "source": "guest-agent"}
+        output = io.StringIO()
+        with patch.object(self.controller, "_get_guest_agent_meminfo", return_value=stats) as sample, \
+                patch.object(self.controller, "host_memory_pressure") as pressure, \
+                patch.object(self.controller, "process_domainID") as process, \
+                patch.object(self.controller, "dom_print_names"), \
+                patch.object(self.controller, "_get_guest_agent_memory_pressure", return_value=(None, None)), \
+                redirect_stdout(output):
+            self.controller.process_domains()
+            sample.assert_not_called()
+            pressure.assert_not_called()
+            process.assert_not_called()
+            self.controller.status()
+
+        sample.assert_called_once_with(self.domain)
+        self.assertEqual(output.getvalue().splitlines()[1].split()[:2],
+                         ["guest-a", "agent/read-only"])
+
     def test_poll_prioritizes_yield_score_and_leaves_zero_idle_last(self):
         secondary = Domain("secondary")
         secondary.memory, secondary.usable = 1000000, 400000
@@ -1263,7 +1449,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("guest-new", self.controller.monitored_vms)
         self.assertIn("guest-new", self.controller.guest_agents)
         self.assertIn("guest-new", self.controller.read_only_vms)
-        self.assertEqual(self.controller.stats_periods["guest-new"], 5)
+        self.assertNotIn("guest-new", self.controller.stats_periods)
 
     def test_virtio_mem_without_balloon_is_monitored_with_guest_agent(self):
         self.domain.XMLDesc.return_value = (

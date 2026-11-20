@@ -20,31 +20,38 @@ virtio-mem device. A balloon device normally defines a stats period from 1 to
 </devices>
 ```
 
-If balloon statistics are missing, invalid, or stale, the daemon can instead
-read `MemTotal` and `MemAvailable` from the guest's `/proc/meminfo` through
-QEMU Guest Agent. For this fallback, the XML must define the
+For memory control and `status`, the daemon queries QEMU Guest Agent first.
+It reads `MemTotal`, `MemAvailable`, `AnonPages`,
+`Active(file)`, `Inactive(file)`, `SwapTotal`, and `SwapFree` in a single
+`guest-file-read` of the guest's `/proc/meminfo` per poll when the VM has a
+QEMU Guest Agent channel. The XML must define the
 `org.qemu.guest_agent.0` Unix channel and the agent must be running and
-reachable. It retains the balloon's current allocation when available and
-limits guest available memory to that allocation. When no valid balloon stats
+reachable. With a valid guest sample, the daemon uses `MemTotal` for balloon
+guests without querying balloon statistics. If the agent times out or cannot
+read meminfo (for example, on Windows), it falls back to fresh balloon
+statistics when available. Each agent command has a one-second timeout.
+When no valid balloon stats
 period is configured, the daemon polls at the default 5-second interval.
 Without a usable guest agent, a missing, non-numeric, zero, or greater-than-5
 period produces a warning and the VM is not monitored. `autodeflate='on'` is
 recommended, but optional; its absence produces a warning only.
 The daemon also warns when a balloon device has no `stats period` even if
-QEMU Guest Agent is available as a statistics fallback.
+QEMU Guest Agent is available as the primary statistics source.
 
 A VM without a balloon device is also monitored when its XML defines both a
 SPICE channel (`type='spicevmc'`) and the QEMU Guest Agent channel above. In
-this case, the agent supplies memory statistics and the VM is monitored
-read-only: the daemon does not attempt to adjust its memory.
+this case, the VM appears as `read-only` in `status`, which reads its memory
+statistics from the agent. The daemon does not poll it, adjust its memory,
+or include it when choosing the polling interval.
 
 When a VM has virtio-mem devices but no balloon device, the QEMU Guest Agent
 channel is required to provide guest memory statistics. The daemon then adjusts
 memory by updating the virtio-mem device requests live; no SPICE channel is
 required. If both devices are enabled, the daemon adjusts only virtio-mem.
 When virtio-mem sizes are available, `Actual` is the fixed RAM plus the
-currently plugged virtio-mem, while `Usable` can still come from fresh balloon
-statistics. If the balloon has been adjusted separately, those values may not
+currently plugged virtio-mem. Guest Agent `Usable` is capped at this allocation.
+`Usable` can still come from fresh balloon statistics when the agent is unavailable.
+If the balloon has been adjusted separately, those values may not
 describe the same guest memory allocation. Prefer disabling the balloon with
 `<memballoon model='none'/>` and using QEMU Guest Agent for statistics on
 virtio-mem guests.
@@ -55,10 +62,14 @@ active monitored VMs, using libvirt's event loop. Inactive VMs do not affect
 the interval, and stats periods on a `<memballoon model='none'>` device are
 ignored. Discovery, definition changes, and removal of VMs recalculate the
 interval and update the running timer without restarting the daemon. With no
-active monitored VMs, the interval is 5 seconds.
+active monitored VMs, the interval is 5 seconds. For large fleets using the
+agent, prefer a 3- to 5-second interval to limit polling overhead.
 Each VM is controlled only when its own statistics have updated. Guest Agent
-statistics are refreshed on demand and used only when fresh balloon statistics
-are unavailable.
+samples use monotonic collection time, so two samples in the same wall-clock
+second are still distinct. Guest
+`/proc/pressure/memory` is read only after a successful Guest Agent meminfo
+read, when available memory is below twice the effective reserve or the PD
+controller computes a negative correction.
 
 After an initial inventory, libvirt lifecycle events discover newly defined
 or started VMs and recheck their monitoring requirements without restarting
@@ -168,17 +179,30 @@ libvirt-autoreclaim --config /path/to/autoreclaim.json start
 libvirt-autoreclaim -c /path/to/autoreclaim.json status
 ```
 
-`status` displays an aligned table of active monitored VMs, including the
-statistics source (`balloon`, `guest-agent`, or `unavailable`) and the memory
-method (`balloon`, `virtio-mem`, or `read-only`), as well as memory values in
-MiB and the effective memory weight. Column widths adapt to domain names and
-values. Connection, configuration-loading, and monitoring messages are hidden
-by default. An unresponsive or disconnected QEMU Guest Agent is reported only
-with `--debug`; if no other statistics are available, `Stats_Source`
-shows `unavailable`. Other warnings and errors remain visible. The `start`
+`status` displays an aligned table of active monitored VMs, including `Backend`,
+memory values in MiB, and the effective memory weight. `Backend` combines the
+statistics source (`agent`, `balloon`, or `unavailable`) and the memory method
+(`balloon`, `virtio-mem`, or `read-only`) as `source/method`. For example,
+`agent/virtio-mem` uses QEMU Guest Agent statistics and adjusts memory via
+virtio-mem. `balloon/balloon` is displayed simply as `balloon`. Column
+widths adapt to domain names and values. Connection, configuration-loading,
+and monitoring messages are hidden by default. An unresponsive or disconnected
+QEMU Guest Agent is reported only with `--debug`; if no other statistics are
+available, `Backend` uses `unavailable` as the source. Other warnings and
+errors remain visible. The `start`
 command retains informational logs.
 Informational messages have no level prefix; other log levels retain their
 prefixes (`DEBUG`, `WARNING`, `ERROR`).
+
+- `Floor`: effective reclaim floor in MiB, including the reserve, fixed
+  virtio-mem base RAM, and guest anonymous pages and active file cache when
+  available. This is a reclaim limit, not a growth target; read-only VMs show
+  `n/a`.
+- `PSI`: guest memory `some avg10`, reported as a percentage. `status` reads
+  it once per VM whose `Backend` starts with `agent/`; it shows `n/a` if
+  unavailable. This does not change PSI polling in the daemon.
+- `Swap_Used`: guest `SwapTotal - SwapFree` in MiB from the same meminfo sample,
+  or `n/a` if the counters are unavailable.
 
 The `default` section supplies values for every VM. A VM entry overrides those
 values. If `auto_reclaim` is omitted from both places, it defaults to `false`.
@@ -245,7 +269,7 @@ per VM (or in `default`) to the desired number of seconds; `3600` gives one
 hour. During that time the daemon can still increase memory if the VM needs it.
 It defaults to `0` (no delay) and must be a non-negative integer. The daemon
 starts tracking at launch, so increases made before it starts are not detected.
-Detection uses fresh balloon memory samples, allowing for virtio's 4 KiB page
+Detection uses fresh memory samples, allowing for virtio's 4 KiB page
 rounding and the daemon's outstanding requests. It is not proof of an operator
 action: an increase not attributable to the daemon, including guest autodeflate,
 can also start the grace period. Logs call these increases "unattributed".
@@ -465,12 +489,16 @@ memory exceed the reserve. It never consumes that instantaneous reserve.
 The derivative term can brake reclaim but cannot turn it into growth while
 the smoothed reserve is satisfied, unless an emergency growth signal is present.
 
-If instantaneous usable memory is below the reserve, or used memory grows
-faster than 5% of current RAM per second, growth bypasses EWMA smoothing.
+Growth bypasses EWMA smoothing if instantaneous usable memory is below the
+reserve, used memory grows faster than 5% of current RAM per second, guest
+memory PSI `full avg10` exceeds 1%, or guest `SwapFree` falls faster than
+10 MiB/s between samples.
 The controller requests at least 25% of current RAM, or enough to cover the
 reserve deficit and another polling interval of positive consumption trend,
 whichever is larger. Ordinary positive PD corrections are capped at 50% of
-current RAM per sample. All requests are capped at the VM's maximum memory.
+current RAM per sample. Guest memory PSI `some avg10` above 10% forces an
+ordinary growth request of at least 10% of current RAM instead of allowing a
+negative PD correction. All requests are capped at the VM's maximum memory.
 Progress toward an outstanding growth request does not trigger manual-increase
 grace periods. Ordinary adjustments wait until the previous memory request
 completes, rather than reversing or replacing a request still in flight.
@@ -480,20 +508,28 @@ guest does not block future adjustments indefinitely. The daemon may retry on
 the next usable sample, subject to the normal pressure and grace-period rules.
 Expiration is checked even when guest statistics are stale.
 
-The minimum RAM target accounts for both the absolute reserve and the configured
-ratio, capped at the VM's maximum:
+The static floor protects the reserve. A separate floor protects the guest's
+anonymous pages and active file cache during reclaim only:
 
 ```
-ReserveFloor = int(2 * keep_free_kb / max(0.1, 1 - keep_free_ratio))
-Floor = min(maximum_ram, max(minimum_ram, ReserveFloor))
+Denominator = max(0.1, 1 - keep_free_ratio)
+ReserveFloor = int(2 * keep_free_kb / Denominator)
+GuestFloor = ceil((AnonPages + Active(file) + keep_free_kb) / Denominator)
+StaticFloor = min(maximum_ram, max(minimum_ram, ReserveFloor))
+ReclaimFloor = min(maximum_ram, max(StaticFloor, GuestFloor))
 ```
 
 `minimum_ram` is zero for balloon and the fixed (non-virtio-mem) RAM for
 virtio-mem. The denominator is bounded below by 0.1, including for ratios near
-or equal to 1. A VM below this floor can be grown to it even when its
-instantaneous reserve is sufficient. The proportional reserve still uses
+or equal to 1. A VM below the static floor can be grown to it even when its
+instantaneous reserve is sufficient, unless the proposed reclaim was vetoed.
+If the guest floor reaches or exceeds current RAM, reclaim is skipped; active
+file cache cannot trigger growth. The proportional reserve still uses
 current RAM, not the VM's historical or maximum RAM. A VM whose maximum is too
-small cannot maintain the configured reserve.
+small cannot maintain the configured reserve. `Inactive(file)` is not part of
+the floor. If either guest floor metric is missing, the reserve floor still
+applies. Balloon pages and virtio-mem blocks are rounded so that a guest-backed
+floor is not crossed, subject to the VM's maximum.
 
 - **Balloon:** Round the capped target down to a multiple of 4 KiB. Skip the
   adjustment if the rounded target differs from current RAM by less than 1 MiB.
@@ -540,8 +576,14 @@ For example, idle ratio 0.4 with weight 50 scores 0.8, ahead of idle ratio
 0.6 with weight 200, which scores 0.3. Zero idle memory scores zero regardless
 of weight.
 
+Guest memory PSI `some avg10` above 2%, any positive `full avg10`, or any drop in
+`SwapFree` since the previous sample vetoes reclaim, including idle reclaim.
+When `some avg10` is above 0.5% and at most 2%, the reclaim rate is multiplied by
+`1 - some_avg10 / 2.0`. Missing guest metrics are not treated as pressure
+signals; the other available limits still apply.
+
 Each reclaim is bounded by the negative PD correction, the safely reclaimable
-surplus, and:
+surplus, and the following rate limit before guest PSI damping:
 
 ```
 actual * reclaim_ratio * Elapsed * Pressure * idle_ratio * min(2.0, 100.0 / memory_weight)

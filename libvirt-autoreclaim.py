@@ -11,13 +11,23 @@ import xml.etree.ElementTree as ET
 import libvirt
 
 from time import monotonic, time
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 SZ_4KiB = 4
 SZ_1MiB = 1024
 SZ_256MiB = 256 * 1024
 SZ_512MiB = 512 * 1024
 HOST_PRESSURE_UNAVAILABLE = -1.0
+GUEST_SWAP_EMERGENCY_KIB_PER_SEC = 10 * SZ_1MiB
+GUEST_MEMINFO_FIELDS = {
+    "MemTotal": "actual",
+    "MemAvailable": "usable",
+    "AnonPages": "anon_pages",
+    "Active(file)": "active_file",
+    "Inactive(file)": "inactive_file",
+    "SwapTotal": "swap_total",
+    "SwapFree": "swap_free",
+}
 
 UNIT_MULTIPLIERS = {
     "b": 1 / 1024.0,
@@ -54,6 +64,9 @@ class MemorySample(NamedTuple):
     used: int
     error: float
     updated: int
+    source: Optional[str] = None
+    swap_free: Optional[int] = None
+    sampled_at: Optional[float] = None
 
 class ExitFailure(Exception):
     pass
@@ -180,75 +193,112 @@ class LibVirtAutoReclaim:
                 return self.__vm_config(vm)
         return self.config.get("default", {})
 
-    def _get_guest_agent_meminfo(self, dom):
+    def _read_guest_agent_file(self, dom, path):
         name = dom.name()
         handle = None
         try:
             import libvirt_qemu
             command = json.dumps({
                 "execute": "guest-file-open",
-                "arguments": {"path": "/proc/meminfo", "mode": "r"},
+                "arguments": {"path": path, "mode": "r"},
             })
             handle = json.loads(libvirt_qemu.qemuAgentCommand(dom, command, 1, 0))["return"]
-            chunks = []
-            while True:
-                command = json.dumps({
-                    "execute": "guest-file-read",
-                    "arguments": {"handle": handle, "count": 4096},
-                })
-                response = json.loads(libvirt_qemu.qemuAgentCommand(dom, command, 1, 0))
-                result = response.get("return", {})
-                encoded = result.get("buf-b64", "")
-                if encoded:
-                    chunks.append(base64.b64decode(encoded).decode("utf-8", errors="ignore"))
-                if result.get("eof", True) or not encoded:
-                    break
-            mem_total = 0
-            mem_available = -1
-            for line in "".join(chunks).splitlines():
-                fields = line.split()
-                if len(fields) >= 2:
-                    if fields[0] == "MemTotal:":
-                        mem_total = int(fields[1])
-                    elif fields[0] == "MemAvailable:":
-                        mem_available = int(fields[1])
-            if mem_total > 0 and mem_available >= 0:
-                return {
-                    "actual": mem_total,
-                    "usable": mem_available,
-                    "last_update": int(time()),
-                    "source": "guest-agent",
-                }
+            count = 16384
+            command = json.dumps({
+                "execute": "guest-file-read",
+                "arguments": {"handle": handle, "count": count},
+            })
+            result = json.loads(libvirt_qemu.qemuAgentCommand(dom, command, 1, 0))["return"]
+            encoded = result.get("buf-b64", "") if isinstance(result, dict) else None
+            if not isinstance(encoded, str):
+                raise ValueError("invalid guest-file-read response")
+            data = base64.b64decode(encoded, validate=True)
+            if len(data) >= count and not result.get("eof"):
+                raise ValueError("truncated procfs read")
+            return data.decode("utf-8")
         except (ImportError, libvirt.libvirtError, KeyError, ValueError) as error:
-            logging.debug("%s guest-agent meminfo failed: %s", name, error)
+            logging.debug("%s guest-agent read of %s failed: %s", name, path, error)
         finally:
             if handle is not None:
                 try:
-                    import libvirt_qemu
                     command = json.dumps({
                         "execute": "guest-file-close",
                         "arguments": {"handle": handle},
                     })
                     libvirt_qemu.qemuAgentCommand(dom, command, 1, 0)
                 except (ImportError, libvirt.libvirtError) as error:
-                    logging.debug("%s guest-agent meminfo close failed: %s", name, error)
+                    logging.debug("%s guest-agent close of %s failed: %s", name, path, error)
         return None
+
+    def _get_guest_agent_meminfo(self, dom):
+        data = self._read_guest_agent_file(dom, "/proc/meminfo")
+        if data is None:
+            return None
+        stats = {}
+        for line in data.splitlines():
+            label, _, value = line.partition(":")
+            key = GUEST_MEMINFO_FIELDS.get(label)
+            if key is not None:
+                try:
+                    amount, unit = value.split()
+                    amount = int(amount)
+                    if unit != "kB" or amount < 0:
+                        raise ValueError("expected nonnegative kB")
+                    stats[key] = amount
+                except ValueError as error:
+                    logging.debug("%s invalid guest %s: %s", dom.name(), label, error)
+        total, available = stats.get("actual", 0), stats.get("usable", -1)
+        if total <= 0 or not 0 <= available <= total:
+            logging.debug("%s guest meminfo lacks valid MemTotal/MemAvailable", dom.name())
+            return None
+        return {**stats, "last_update": int(time()), "source": "guest-agent",
+                "sampled_at": monotonic()}
+
+    def _get_guest_agent_memory_pressure(self, dom):
+        data = self._read_guest_agent_file(dom, "/proc/pressure/memory")
+        averages = {}
+        if data is not None:
+            for line in data.splitlines():
+                fields = line.split()
+                if not fields or fields[0] not in ("some", "full"):
+                    continue
+                try:
+                    value = next(field[6:] for field in fields[1:] if field.startswith("avg10="))
+                    average = float(value)
+                    if not 0 <= average <= 100:
+                        raise ValueError("avg10 out of range")
+                    averages[fields[0]] = average
+                except (StopIteration, ValueError):
+                    logging.debug("%s invalid guest memory PSI %s avg10", dom.name(), fields[0])
+        return averages.get("some"), averages.get("full")
 
     def _get_domain_memstats(self, dom):
         name = dom.name()
         if name in self.read_only_vms:
             return self._get_guest_agent_meminfo(dom) or {}
         backend = self.vm_backends.get(name, {})
+        guest_stats = None
+        if backend.get("has_guest_agent") or name in self.guest_agents:
+            guest_stats = self._get_guest_agent_meminfo(dom)
+        virtio_actual = None
+        if backend.get("type") == "virtio-mem":
+            vmem_info = self._inspect_virtio_mem_devices(dom)
+            if vmem_info is not None:
+                virtio_actual = vmem_info["base_ram_kb"] + vmem_info["total_current_kb"]
+        if guest_stats is not None:
+            if virtio_actual is None:
+                return guest_stats
+            return {
+                **guest_stats,
+                "actual": virtio_actual,
+                "usable": min(virtio_actual, guest_stats["usable"]),
+            }
         try:
             memstat = dom.memoryStats()
         except libvirt.libvirtError as error:
             logging.debug("%s balloon memory stats failed: %s", name, error)
             memstat = {}
-        actual = memstat.get("actual", 0)
-        if backend.get("type") == "virtio-mem":
-            vmem_info = self._inspect_virtio_mem_devices(dom)
-            if vmem_info is not None:
-                actual = vmem_info["base_ram_kb"] + vmem_info["total_current_kb"]
+        actual = virtio_actual if virtio_actual is not None else memstat.get("actual", 0)
         usable = memstat.get("usable", -1)
         updated = memstat.get("last_update", 0)
         if actual > 0 and 0 <= usable <= actual and updated > 0 and 0 <= time() - updated <= 15:
@@ -258,17 +308,7 @@ class LibVirtAutoReclaim:
                 "last_update": updated,
                 "source": "balloon",
             }
-        if backend.get("has_guest_agent") or name in self.guest_agents:
-            guest_stats = self._get_guest_agent_meminfo(dom)
-            if guest_stats is not None:
-                effective_actual = actual if actual > 0 else guest_stats["actual"]
-                return {
-                    "actual": effective_actual,
-                    "usable": min(effective_actual, guest_stats["usable"]),
-                    "last_update": guest_stats["last_update"],
-                    "source": "guest-agent",
-                }
-        return memstat
+        return {**memstat, "actual": actual} if memstat else {}
 
     def _inspect_virtio_mem_devices(self, dom):
         try:
@@ -316,6 +356,27 @@ class LibVirtAutoReclaim:
             logging.warning("%s cannot inspect virtio-mem configuration: %s", dom.name(), error)
             return None
 
+    def _memory_bounds(self, dom, backend_type, maximum_ram):
+        if backend_type == "virtio-mem":
+            vmem_info = self._inspect_virtio_mem_devices(dom)
+            if vmem_info is not None:
+                return vmem_info["base_ram_kb"], vmem_info["max_ram_kb"]
+        return 0, maximum_ram
+
+    def _memory_floors(self, dom, memstat, parameters, backend_type, bounds):
+        minimum_ram, maximum_ram = bounds
+        min_reserve = self.dom_keep_usable(dom, 0)
+        denominator = max(0.1, 1 - parameters.get("keep_free_ratio", 0.1))
+        static_floor = min(maximum_ram, max(minimum_ram, int(2 * min_reserve / denominator)))
+        anon_pages, active_file = memstat.get("anon_pages"), memstat.get("active_file")
+        if anon_pages is None or active_file is None:
+            return static_floor, static_floor
+        guest_floor = min(maximum_ram, math.ceil((anon_pages + active_file + min_reserve) / denominator))
+        if guest_floor > static_floor and backend_type == "balloon":
+            guest_floor = min((maximum_ram // SZ_4KiB) * SZ_4KiB,
+                              ((guest_floor + SZ_4KiB - 1) // SZ_4KiB) * SZ_4KiB)
+        return static_floor, max(static_floor, guest_floor)
+
     def dom_status(self, dom):
         memstat = self._get_domain_memstats(dom)
         actual = memstat.get("actual", 0)
@@ -324,21 +385,41 @@ class LibVirtAutoReclaim:
         total_ram = dom.info()[1]
         keep_usable = self.dom_keep_usable(dom, actual)
         name = dom.name()
-        memory_weight = self.__vm_config_for_name(name).get("memory_weight", 100)
+        parameters = self.__vm_config_for_name(name)
+        memory_weight = parameters.get("memory_weight", 100)
         backend = self.vm_backends.get(name, {"type": "balloon"})
         stats_method = memstat.get("source", "unavailable")
         memory_method = "read-only" if name in self.read_only_vms else backend["type"]
+        stats_label = "agent" if stats_method == "guest-agent" else stats_method
+        backend_label = (
+            "balloon" if stats_label == memory_method == "balloon"
+            else f"{stats_label}/{memory_method}")
+        floor = psi = swap_used = "n/a"
+        if memory_method != "read-only":
+            bounds = self._memory_bounds(dom, memory_method, total_ram)
+            _, reclaim_floor = self._memory_floors(dom, memstat, parameters, memory_method, bounds)
+            floor = str(reclaim_floor // SZ_1MiB)
+        if stats_method == "guest-agent":
+            psi_some, _ = self._get_guest_agent_memory_pressure(dom)
+            if psi_some is not None:
+                psi = f"{psi_some:.2f}".rstrip("0").rstrip(".") + "%"
+            swap_total, swap_free = memstat.get("swap_total"), memstat.get("swap_free")
+            if swap_total is not None and swap_free is not None and 0 <= swap_free <= swap_total:
+                swap_used = str((swap_total - swap_free) // SZ_1MiB)
+            elif swap_total is not None and swap_free is not None:
+                logging.debug("%s invalid guest swap totals", name)
         return (
             name,
-            stats_method,
-            memory_method,
+            backend_label,
             str(int(total_ram / SZ_1MiB)),
             str(int(actual / SZ_1MiB)),
             str(int(used / SZ_1MiB)),
             str(int(usable / SZ_1MiB)),
             str(int(keep_usable / SZ_1MiB)),
             str(memory_weight),
-            "MiB",
+            floor,
+            psi,
+            swap_used,
         )
 
     def status(self):
@@ -347,8 +428,8 @@ class LibVirtAutoReclaim:
         if domainIDs is None:
             raise ExitFailure('No active domains')
         rows = [(
-            "Domain", "Stats_Source", "Memory_Method", "Total", "Actual",
-            "Used", "Usable", "Keep_Usable", "Weight", "Units",
+            "Domain", "Backend", "Total", "Actual",
+            "Used", "Usable", "Keep_Usable", "Weight", "Floor", "PSI", "Swap_Used",
         )]
         for domainID in domainIDs:
             dom = self.conn.lookupByID(domainID)
@@ -357,13 +438,13 @@ class LibVirtAutoReclaim:
         widths = [max(len(value) for value in column) for column in zip(*rows)]
         for row in rows:
             print("  ".join(
-                value.ljust(width) if index in (0, 1, 2, len(row) - 1) else value.rjust(width)
+                value.ljust(width) if index < 2 else value.rjust(width)
                 for index, (value, width) in enumerate(zip(row, widths))
             ).rstrip(), flush=True)
 
     def process_domainID(self, dom, host_pressure=None, memstat=None):
         name = dom.name()
-        if name not in self.monitored_vms:
+        if name not in self.monitored_vms or name in self.read_only_vms:
             return
         backend = self.vm_backends.get(name, {"type": "balloon"})
         parameters = self.__vm_config_for_name(name)
@@ -392,20 +473,21 @@ class LibVirtAutoReclaim:
             self.control_samples.pop(name, None)
             return
         previous = self.control_samples.get(name)
-        if previous is not None and updated == previous.updated:
-            logging.debug("%s memory stats have not updated, skipping", name)
-            return
-        if name in self.read_only_vms:
-            logging.debug("%s is monitored read-only because it has no balloon device", name)
-            return
-        info = dom.info()
-        max_allowed_ram = info[1]
-        min_allowed_ram = 0
-        if backend["type"] == "virtio-mem":
-            vmem_info = self._inspect_virtio_mem_devices(dom)
-            if vmem_info is not None:
-                max_allowed_ram = vmem_info["max_ram_kb"]
-                min_allowed_ram = vmem_info["base_ram_kb"]
+        source = memstat.get("source")
+        sampled_at = memstat.get("sampled_at") if source == "guest-agent" else None
+        if previous is not None and previous.source != source:
+            previous = None
+        sample_interval = 0.0
+        if previous is not None:
+            if sampled_at is not None and previous.sampled_at is not None:
+                sample_interval = sampled_at - previous.sampled_at
+            else:
+                sample_interval = updated - previous.updated
+            if sample_interval == 0:
+                logging.debug("%s memory stats have not updated, skipping", name)
+                return
+        bounds = self._memory_bounds(dom, backend["type"], dom.info()[1])
+        _, max_allowed_ram = bounds
         previous_memory = self.memory_targets.get(name)
         own_growth = pending_target is not None and actual <= pending_target + SZ_4KiB
         external_increase = (
@@ -426,7 +508,16 @@ class LibVirtAutoReclaim:
                 "{} unattributed memory increase: {} -> {} KiB; "
                 "postponing reductions for {} seconds".format(name, previous_memory, actual, grace),
                 flush=True)
-        if external_increase or previous is not None and updated < previous.updated:
+        swap_total, swap_free = memstat.get("swap_total"), memstat.get("swap_free")
+        if swap_total is None or swap_free is None or not 0 <= swap_free <= swap_total:
+            swap_free = None
+        swap_drop = 0
+        swap_rate = 0.0
+        if (previous is not None and sample_interval > 0
+                and swap_free is not None and previous.swap_free is not None):
+            swap_drop = previous.swap_free - swap_free
+            swap_rate = swap_drop / sample_interval
+        if external_increase or sample_interval < 0:
             previous = None
         used = actual - usable
         alpha = parameters.get("ewma_alpha", 0.3)
@@ -437,24 +528,31 @@ class LibVirtAutoReclaim:
         used_rate = 0
         elapsed = self.stats_periods.get(name, self.poll_interval)
         if previous is not None:
-            elapsed = max(1, updated - previous.updated)
+            elapsed = max(1, sample_interval)
             derivative = (error - previous.error) / elapsed
             used_rate = (used - previous.used) / elapsed
-        self.control_samples[name] = MemorySample(used_ewma, used, error, updated)
+        self.control_samples[name] = MemorySample(
+            used_ewma, used, error, updated, source, swap_free, sampled_at)
         derivative_term = max(
             -abs(error), min(abs(error), parameters.get("pd_kd", 1.0) * derivative))
         delta = parameters.get("pd_kp", 0.5) * error + derivative_term
-        emergency = usable < reserve or used_rate > actual * 0.05
+        emergency = (usable < reserve or used_rate > actual * 0.05
+                     or swap_rate > GUEST_SWAP_EMERGENCY_KIB_PER_SEC)
+        psi_some = psi_full = None
+        if source == "guest-agent" and (usable < 2 * reserve or delta < 0):
+            psi_some, psi_full = self._get_guest_agent_memory_pressure(dom)
+        emergency = emergency or (psi_full is not None and psi_full > 1.0)
         if emergency:
             delta = max(delta, reserve - usable + max(0, used_rate) * self.poll_interval,
                         actual * 0.25)
+        elif psi_some is not None and psi_some > 10.0:
+            delta = min(actual * 0.5, max(delta, actual * 0.1))
         elif error <= 0:
             delta = min(delta, 0)
         elif delta > 0:
             delta = min(delta, actual * 0.5)
-        min_reserve = self.dom_keep_usable(dom, 0)
-        pd_floor = int(min_reserve * 2 / max(0.1, 1 - parameters.get("keep_free_ratio", 0.1)))
-        floor = min(max_allowed_ram, max(min_allowed_ram, pd_floor))
+        floor, reclaim_floor = self._memory_floors(dom, memstat, parameters, backend["type"], bounds)
+        dynamic_floor = 0
         if delta < 0:
             if now < self.manual_increase_until.get(name, 0):
                 logging.debug("%s reduction postponed after an unattributed memory increase", name)
@@ -470,8 +568,23 @@ class LibVirtAutoReclaim:
             reclaim_limit = (
                 actual * parameters.get("reclaim_ratio", 0.015) * elapsed * host_pressure * idle_ratio
                 * weight_multiplier)
+            guest_factor = 1.0
+            if (swap_drop > 0 or (psi_full is not None and psi_full > 0)
+                    or (psi_some is not None and psi_some > 2.0)):
+                guest_factor = 0.0
+            elif psi_some is not None and psi_some > 0.5:
+                guest_factor = 1 - psi_some / 2.0
+            if guest_factor == 0:
+                logging.debug("%s reclaim blocked by guest: swap_drop=%s psi_some=%s psi_full=%s",
+                              name, swap_drop, psi_some, psi_full)
+                return
             surplus = max(0, min(usable - reserve, -error))
-            delta = -min(-delta, reclaim_limit, surplus)
+            delta = -min(-delta, reclaim_limit * guest_factor, surplus)
+            if delta < 0 and floor <= actual and reclaim_floor > floor:
+                if reclaim_floor >= actual:
+                    logging.debug("%s guest floor prevents reclaim: %s KiB", name, reclaim_floor)
+                    return
+                floor = dynamic_floor = reclaim_floor
         target = min(max_allowed_ram, max(floor, actual + int(delta)))
         if pending_target is not None and not (emergency and target > max(actual, pending_target)):
             logging.debug("%s waiting for memory target %s KiB; actual=%s KiB",
@@ -479,11 +592,12 @@ class LibVirtAutoReclaim:
             return
         logging.debug(
             "%s [%s] actual=%s usable=%s used_ewma=%.1f reserve=%.1f error=%.1f "
-            "derivative=%.1f used_rate=%.1f emergency=%s target=%s KiB",
+            "derivative=%.1f used_rate=%.1f swap_drop_rate=%.1f psi_some=%s psi_full=%s "
+            "emergency=%s floor=%s target=%s KiB",
             name, backend["type"], actual, usable, used_ewma, reserve, error,
-            derivative, used_rate, emergency, target)
+            derivative, used_rate, swap_rate, psi_some, psi_full, emergency, floor, target)
         if backend["type"] == "virtio-mem":
-            requested = dom_virtio_mem(dom, target, actual)
+            requested = dom_virtio_mem(dom, target, actual, minimum_ram_kb=dynamic_floor)
         else:
             requested = dom_balloon(dom, target, actual, max_allowed_ram)
         if requested is not None:
@@ -529,7 +643,7 @@ class LibVirtAutoReclaim:
             try:
                 dom = self.conn.lookupByID(domainID)
                 name = dom.name()
-                if name not in self.monitored_vms:
+                if name not in self.monitored_vms or name in self.read_only_vms:
                     continue
                 memstat = self._get_domain_memstats(dom)
                 actual = memstat.get("actual", 0)
@@ -566,7 +680,7 @@ class LibVirtAutoReclaim:
                 libvirt.virEventUpdateTimeout(self.timer_id, interval * 1000)
 
     def __forget_domain(self, name):
-        if name in self.monitored_vms:
+        if name in self.monitored_vms and name not in self.read_only_vms:
             logging.info("Stopped monitoring %s", name)
         self.monitored_vms.discard(name)
         self.guest_agents.discard(name)
@@ -580,13 +694,14 @@ class LibVirtAutoReclaim:
 
     def __refresh_domain(self, dom):
         name = dom.name()
+        was_polled = name in self.monitored_vms and name not in self.read_only_vms
         try:
             active = dom.isActive()
         except libvirt.libvirtError as error:
             logging.debug("%s cannot determine active state for monitoring: %s", name, error)
             return
         if active and self.__can_monitor_domain(dom):
-            if name not in self.monitored_vms:
+            if not was_polled and name not in self.read_only_vms:
                 logging.info("Monitoring %s", name)
             self.monitored_vms.add(name)
         else:
@@ -656,7 +771,6 @@ class LibVirtAutoReclaim:
                 self.pending_targets.pop(name, None)
                 self.manual_increase_until.pop(name, None)
                 self.control_samples.pop(name, None)
-                self.__set_stats_period_if_active(dom, 5)
                 return True
             print("Not monitoring {}: balloon device is missing or disabled".format(name), flush=True)
             return False
@@ -783,7 +897,7 @@ def dom_balloon(dom, restrict_to, actual, total_ram):
     dom.setMemory(restrict_to)
     return restrict_to
 
-def dom_virtio_mem(dom, target_total_kb, actual_total_kb):
+def dom_virtio_mem(dom, target_total_kb, actual_total_kb, *, minimum_ram_kb=0):
     name = dom.name()
     try:
         domain_xml = ET.fromstring(dom.XMLDesc(0))
@@ -833,6 +947,20 @@ def dom_virtio_mem(dom, target_total_kb, actual_total_kb):
         updates.append((device, aligned_requested))
         new_total_requested += aligned_requested
     new_total_ram = base_ram_kb + new_total_requested
+    if new_total_ram < minimum_ram_kb:
+        # Rounding to the nearest blocks must not lower a guest-backed floor.
+        for index, (device, requested_kb) in enumerate(updates):
+            block = device["block_kb"]
+            if requested_kb + block <= device["size_kb"]:
+                updates[index] = (device, requested_kb + block)
+                new_total_ram += block
+                if new_total_ram >= minimum_ram_kb:
+                    break
+        else:
+            logging.debug("%s cannot reach guest memory floor at device block granularity", name)
+            return None
+        if target_total_kb < actual_total_kb < new_total_ram:
+            return None
     difference = abs(actual_total_kb - new_total_ram)
     min_block = min(device["block_kb"] for device in devices)
     if difference < max(SZ_1MiB, min_block):
