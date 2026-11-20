@@ -1,3 +1,4 @@
+import io
 import os
 import stat
 import tempfile
@@ -255,11 +256,22 @@ class VirtioMemConvertTests(unittest.TestCase):
             "<domain><memory unit='GiB'>4</memory>"
             "<currentMemory unit='GiB'>3</currentMemory></domain>"
         )
-        for initial_kib, expected_requested in ((None, 2097152), (2097153, 1048576)):
+        for initial_kib, expected_requested, expected_warning in (
+            (None, 2097152, ''),
+            (1500 * 1024, 476 * 1024, ''),
+            (
+                1501 * 1024,
+                476 * 1024,
+                'Warning: --initial-memory rounded down from 1537024 KiB to '
+                '1536000 KiB to align with 2 MiB blocks.\n',
+            ),
+        ):
             with self.subTest(initial_kib=initial_kib):
-                result = virtiomem_convert.transform_xml_string(
-                    xml, 'to-virtiomem', 1048576, initial_kib=initial_kib
-                )
+                with patch('sys.stderr', new_callable=io.StringIO) as stderr:
+                    result = virtiomem_convert.transform_xml_string(
+                        xml, 'to-virtiomem', 1048576, initial_kib=initial_kib
+                    )
+                self.assertEqual(stderr.getvalue(), expected_warning)
                 root = ElementTree.fromstring(result)
                 self.assertEqual(root.findtext('currentMemory'), '1048576')
                 requested = root.find('devices/memory/target/requested')
@@ -307,7 +319,7 @@ class VirtioMemConvertTests(unittest.TestCase):
         self.assertTrue(colored_minus[0].startswith(virtiomem_convert.ANSI_RED))
         self.assertTrue(colored_plus[0].startswith(virtiomem_convert.ANSI_GREEN))
 
-    def test_stdlib_fallback_preserves_qemu_namespace_prefix(self):
+    def test_conversion_preserves_qemu_namespace_prefix(self):
         xml = """<domain xmlns:qemu='http://libvirt.org'>
   <memory unit='KiB'>4096</memory>
   <currentMemory unit='KiB'>3072</currentMemory>
@@ -323,14 +335,59 @@ class VirtioMemConvertTests(unittest.TestCase):
   <qemu:commandline><qemu:arg value='-foo'/></qemu:commandline>
 </domain>"""
 
-        with patch.object(virtiomem_convert, 'HAS_LXML', False), patch.object(
-            virtiomem_convert, 'ET', ElementTree
-        ):
-            result = virtiomem_convert.transform_xml_string(xml, 'to-balloon', 1024)
+        result = virtiomem_convert.transform_xml_string(xml, 'to-balloon', 1024)
 
         self.assertIn('<qemu:commandline>', result)
         self.assertIn('<qemu:arg ', result)
         self.assertNotIn('<ns0:commandline>', result)
+
+    def test_conversion_preserves_comments_and_processing_instructions(self):
+        xml = """<!-- outside the domain -->
+<domain>
+  <memory unit='GiB'>4</memory>
+  <!-- keep "this" comment and its <markup> -->
+  <?example test="value"?>
+  <description note="it's intact">Guest</description>
+</domain>"""
+
+        result = virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
+
+        self.assertIn('<!-- keep "this" comment and its <markup> -->', result)
+        self.assertIn('<?example test="value"?>', result)
+        self.assertEqual(ElementTree.fromstring(result).find('description').get('note'), "it's intact")
+
+    def test_metadata_default_namespace_does_not_change_domain_namespace(self):
+        xml = (
+            '<domain><memory unit="GiB">4</memory>'
+            '<metadata><info xmlns="urn:example"/></metadata></domain>'
+        )
+
+        result = virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
+
+        root = ElementTree.fromstring(result)
+        self.assertEqual(root.tag, 'domain')
+        self.assertIsNotNone(root.find('metadata/{urn:example}info'))
+
+    def test_to_virtiomem_preserves_secondary_numa_cell_allocations(self):
+        xml = """<domain>
+  <memory unit='MiB'>4096</memory>
+  <vcpu>4</vcpu>
+  <cpu><numa>
+    <cell id='0' cpus='0-1' memory='3584' unit='MiB'/>
+    <cell id='1' cpus='2-3' memory='512' unit='MiB'/>
+  </numa></cpu>
+</domain>"""
+
+        result = virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
+
+        root = ElementTree.fromstring(result)
+        first, second = root.findall('cpu/numa/cell')
+        self.assertEqual(root.findtext('memory'), '1048576')
+        self.assertEqual(first.attrib, {'id': '0', 'cpus': '0-1', 'memory': '524288', 'unit': 'KiB'})
+        self.assertEqual(second.attrib, {'id': '1', 'cpus': '2-3', 'memory': '512', 'unit': 'MiB'})
+
+        with self.assertRaisesRegex(ValueError, '524288 KiB memory allocation leaves no room for the first NUMA cell'):
+            virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 524288)
 
     def test_numa_cpu_set_excludes_disabled_vcpus(self):
         xml = """<domain>
@@ -349,10 +406,7 @@ class VirtioMemConvertTests(unittest.TestCase):
   <devices/>
 </domain>"""
 
-        with patch.object(virtiomem_convert, 'HAS_LXML', False), patch.object(
-            virtiomem_convert, 'ET', ElementTree
-        ):
-            result = virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
+        result = virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
 
         root = ElementTree.fromstring(result)
         self.assertEqual(root.find('cpu/numa/cell').get('cpus'), '0,2')
@@ -379,6 +433,19 @@ class VirtioMemConvertTests(unittest.TestCase):
                 result = ElementTree.parse(xml_file).getroot()
             self.assertIsNotNone(result.find('devices/memory[@model="virtio-mem"]'))
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o640)
+
+    def test_atomic_write_uses_normal_creation_mode_without_changing_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'domain.xml')
+            reference = os.path.join(directory, 'reference.xml')
+            with open(reference, 'w', encoding='utf-8'):
+                pass
+
+            with patch.object(virtiomem_convert.os, 'umask', side_effect=AssertionError('umask changed')):
+                virtiomem_convert.write_xml_atomically(path, '<domain/>')
+
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), stat.S_IMODE(os.stat(reference).st_mode))
+            self.assertCountEqual(os.listdir(directory), ['domain.xml', 'reference.xml'])
 
     def test_failed_atomic_replace_keeps_original_and_cleans_temporary_file(self):
         with tempfile.TemporaryDirectory() as directory:

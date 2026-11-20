@@ -78,16 +78,18 @@ repeat these messages for unchanged VMs.
 
 `virtiomem_convert` converts libvirt domain XML between `virtio-balloon` and
 `virtio-mem`. It can read and write XML files, or update a VM directly through
-`virsh`. The script requires Python 3.7 or later; `lxml` is optional and
-preserves comments and XML layout when available. `virsh` is required only for
-direct VM operation.
+`virsh`. The script requires Python 3.7 or later and uses the Python standard
+library to process XML. `virsh` is required only for direct VM operation.
 
 The conversion modes are:
 
 - `to-virtiomem`: sets a fixed base memory and configures a `virtio-mem` device,
   NUMA topology, and maximum memory. The base defaults to `1GiB` and is rounded
   down to a multiple of 2 MiB. The generated NUMA cell excludes vCPU IDs
-  explicitly marked `enabled='no'`. By default, the balloon is disabled with
+  explicitly marked `enabled='no'`. If NUMA cells already exist, the converter
+  preserves all but the first cell's memory allocation and assigns the
+  remaining base memory to the first cell. It rejects a base that leaves no
+  memory for that cell. By default, the balloon is disabled with
   `model='none'`; `-k` (`--keep-balloon`) preserves its current model (or
   creates a `virtio` balloon if one is absent).
 - `to-balloon`: removes `virtio-mem` devices and restores the VM's memory
@@ -105,8 +107,10 @@ virtiomem_convert to-virtiomem vm.xml vm-virtiomem.xml --base-memory 2GiB
 With `to-virtiomem`, use `--initial-memory 3GiB` (or `-i 3GiB`) to start with
 3 GiB of total guest memory instead of the input XML's `<currentMemory>` (or
 `<memory>` if it is absent). The value must be between the fixed base and the
-selected maximum memory and is rounded down to a multiple of 2 MiB. In this
-direction, the option requires a domain without a `virtio-mem` device.
+selected maximum memory. If it is not a multiple of 2 MiB, the converter
+rounds it down and reports the requested and effective values on standard
+error. In this direction, the option requires a domain without a `virtio-mem`
+device.
 
 With `to-balloon`, `--initial-memory` sets `<currentMemory>` directly, without
 2 MiB rounding or changing the calculated `<memory>`. The value must be
@@ -114,9 +118,14 @@ positive and no greater than the resulting `<memory>`.
 
 Use `--max-memory SIZE` (or `-m SIZE`) to override the maximum total guest
 memory in either direction. With `to-virtiomem`, it replaces the input
-`<memory>` as the maximum, rounded down to a multiple of 2 MiB. With
-`to-balloon`, it sets the output `<memory>` directly. If the initial memory
-would exceed the new maximum, also specify a lower `--initial-memory`.
+`<memory>` as the maximum. The order of `--base-memory` and `--max-memory` on
+the command line does not matter: the converter rounds down the base first,
+then rounds down the capacity above that base to whole 2 MiB blocks. For
+example, with `--base-memory 1024M --max-memory 2049M`, the resulting
+`<maxMemory>` is 2048 MiB: 1024 MiB of base memory plus 1024 MiB of virtio-mem
+capacity. With `to-balloon`, `--max-memory` sets the output `<memory>` directly
+without rounding. If the initial memory would exceed the requested maximum,
+also specify a lower `--initial-memory`.
 
 To keep the existing balloon model during conversion:
 
@@ -125,7 +134,8 @@ virtiomem_convert to-virtiomem vm.xml vm-virtiomem.xml -k
 ```
 
 The output XML is written atomically, so the input and output paths may be the
-same.
+same. Replacing an existing file preserves its permission bits; a new file
+uses the system's normal file creation permissions.
 
 Preview the changes without writing a file with `-n` (`--dry-run`).
 Use `-L` (`--color`) with `auto`, `always`, or `never`:
@@ -566,8 +576,8 @@ status 143, which the supplied systemd unit treats as a successful shutdown.
 Requires Python 3 and the `libvirt-python` bindings (for example, the
 `python3-libvirt` package on Debian/Ubuntu).
 `make install` also installs `virtiomem_convert` in `/usr/bin` and its manual
-page in `/usr/share/man/man1`. The converter requires Python 3.7 or later;
-`lxml` is optional, and `virsh` is needed only for direct VM operation.
+page in `/usr/share/man/man1`. The converter requires Python 3.7 or later.
+`virsh` is needed only for direct VM operation.
 
 ```
 ~# make install

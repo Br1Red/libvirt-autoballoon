@@ -10,14 +10,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple, Union
-
-try:
-    from lxml import etree as ET
-    HAS_LXML = True
-except ImportError:
-    import xml.etree.ElementTree as ET
-    HAS_LXML = False
 
 DEFAULT_BASE_KIB = 1048576  # 1 GiB
 BLOCK_KIB = 2048            # 2 MiB
@@ -347,6 +341,14 @@ def convert_to_virtiomem(
     if max_override_kib is not None and vmem_size_kib == 0:
         raise ValueError('--max-memory must leave at least one 2 MiB block above the fixed base.')
     vmem_req_kib = align_down(max(0, start_kib - base_aligned), BLOCK_KIB)
+    if initial_kib is not None:
+        effective_initial_kib = base_aligned + vmem_req_kib
+        if effective_initial_kib != initial_kib:
+            print(
+                f'Warning: --initial-memory rounded down from {initial_kib} KiB to '
+                f'{effective_initial_kib} KiB to align with 2 MiB blocks.',
+                file=sys.stderr,
+            )
     total_max_kib = base_aligned + vmem_size_kib
     max_mem_el = root.find('maxMemory')
     if max_mem_el is None:
@@ -383,8 +385,7 @@ def convert_to_virtiomem(
             indent_level=3,
         )
     else:
-        cells[0].set('memory', str(base_aligned))
-        cells[0].set('unit', 'KiB')
+        resize_first_numa_cell(cells, base_aligned)
     if devices_el is None:
         devices_el = add_child_formatted(root, 'devices', indent_level=1)
     vmem_dev = add_child_formatted(devices_el, 'memory', attrib={'model': 'virtio-mem'}, indent_level=2)
@@ -500,37 +501,44 @@ def convert_to_balloon(
 def resize_first_numa_cell(cells: List[ET.Element], total_kib: int) -> None:
     remaining_kib = total_kib - sum(to_kib(cell.get('memory'), cell.get('unit')) for cell in cells[1:])
     if remaining_kib <= 0:
-        raise ValueError('Maximum memory leaves no room for the first NUMA cell.')
+        raise ValueError(f'The {total_kib} KiB memory allocation leaves no room for the first NUMA cell.')
     cells[0].set('memory', str(remaining_kib))
     cells[0].set('unit', 'KiB')
 
+class DomainTreeBuilder(ET.TreeBuilder):
+    # Python 3.7 has no TreeBuilder insert_comments or insert_pis options.
+    _depth = 0
+
+    def start(self, tag, attrs):
+        self._depth += 1
+        return super().start(tag, attrs)
+
+    def end(self, tag):
+        self._depth -= 1
+        return super().end(tag)
+
+    def comment(self, text):
+        if self._depth:
+            super().start(ET.Comment, {})
+            self.data(text)
+            super().end(ET.Comment)
+
+    def pi(self, target, text):
+        if self._depth:
+            super().start(ET.ProcessingInstruction, {})
+            self.data(f'{target} {text}' if text else target)
+            super().end(ET.ProcessingInstruction)
+
 def format_libvirt_style(xml_str: str) -> str:
-    out = []
-    in_tag = False
-    in_double = False
-    in_single = False
-    for ch in xml_str:
-        if ch == '<' and not in_double and not in_single:
-            in_tag = True
-            out.append(ch)
-        elif ch == '>' and not in_double and not in_single:
-            in_tag = False
-            out.append(ch)
-        elif in_tag:
-            if ch == '"' and not in_single:
-                in_double = not in_double
-                out.append("'")
-            elif ch == "'" and not in_double:
-                in_single = not in_single
-                out.append(ch)
-            else:
-                out.append(ch)
-        else:
-            out.append(ch)
-    result = ''.join(out)
-    if not result.endswith('\n'):
-        result += '\n'
-    return result
+    def format_tag(match):
+        tag = match.group()
+        if tag.startswith(('<!--', '<?')):
+            return tag
+        tag = re.sub(r'"([^"]*)"', lambda attr: "'" + attr[1].replace("'", '&apos;') + "'", tag)
+        return tag[:-3] + '/>' if tag.endswith(' />') else tag
+
+    result = re.sub(r'<!--.*?-->|<\?.*?\?>|<[^<>]*>', format_tag, xml_str, flags=re.DOTALL)
+    return result if result.endswith('\n') else result + '\n'
 
 def transform_xml_string(
     xml_content: str,
@@ -540,14 +548,10 @@ def transform_xml_string(
     initial_kib: Optional[int] = None,
     max_override_kib: Optional[int] = None,
 ) -> str:
-    if HAS_LXML:
-        xml_parser = ET.XMLParser(remove_blank_text=False)
-        root = ET.fromstring(xml_content.encode('utf-8'), xml_parser)
-    else:
-        for _, (prefix, uri) in ET.iterparse(io.StringIO(xml_content), events=('start-ns',)):
-            if prefix != 'xml' and not re.fullmatch(r'ns\d+', prefix):
-                ET.register_namespace(prefix, uri)
-        root = ET.fromstring(xml_content)
+    for _, (prefix, uri) in ET.iterparse(io.StringIO(xml_content), events=('start-ns',)):
+        if prefix and prefix != 'xml' and not re.fullmatch(r'ns\d+', prefix):
+            ET.register_namespace(prefix, uri)
+    root = ET.fromstring(xml_content, parser=ET.XMLParser(target=DomainTreeBuilder()))
     if mode == 'to-virtiomem':
         convert_to_virtiomem(
             root, base_kib=base_kib, keep_balloon=keep_balloon, initial_kib=initial_kib,
@@ -586,9 +590,11 @@ def run_virsh(args: List[str], connect_uri: Optional[str] = None) -> str:
 def write_xml_atomically(path: str, content: str) -> None:
     destination = os.path.realpath(path)
     directory = os.path.dirname(destination) or os.curdir
-    fd, tmp_path = tempfile.mkstemp(prefix='.' + os.path.basename(destination) + '.', dir=directory)
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as output_file:
+    with tempfile.TemporaryDirectory(prefix='.virtiomem-', dir=directory) as tmp_dir:
+        # Keep the staging directory private and usable even under a restrictive umask.
+        os.chmod(tmp_dir, 0o700)
+        tmp_path = os.path.join(tmp_dir, 'domain.xml')
+        with open(tmp_path, 'x', encoding='utf-8') as output_file:
             output_file.write(content)
             output_file.flush()
             os.fsync(output_file.fileno())
@@ -596,14 +602,10 @@ def write_xml_atomically(path: str, content: str) -> None:
         try:
             mode = stat.S_IMODE(os.stat(destination).st_mode)
         except FileNotFoundError:
-            current_umask = os.umask(0)
-            os.umask(current_umask)
-            mode = 0o666 & ~current_umask
-        os.chmod(tmp_path, mode)
+            pass  # The new file already has the mode set at creation.
+        else:
+            os.chmod(tmp_path, mode)
         os.replace(tmp_path, destination)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
 
 def process_vm(
     vm_name: str,
@@ -677,12 +679,12 @@ def main():
     parser.add_argument(
         '-i', '--initial-memory',
         metavar='SIZE',
-        help='Initial total guest memory (overrides the calculated currentMemory in to-balloon)',
+        help='Initial total guest memory (overrides the source or calculated initial memory)',
     )
     parser.add_argument(
         '-m', '--max-memory',
         metavar='SIZE',
-        help='Maximum total guest memory (overrides the source or calculated maximum)',
+        help='Maximum total guest memory (overrides the source or calculated maximum memory)',
     )
     parser.add_argument(
         '-k', '--keep-balloon',

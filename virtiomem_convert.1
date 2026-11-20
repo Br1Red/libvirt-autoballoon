@@ -105,8 +105,9 @@ Initial total guest memory. Uses the same units as
 With
 .BR to\-virtiomem ,
 the domain must not already have a virtio-mem device. The value must be between
-the fixed base and the selected maximum memory and
-is rounded down to a multiple of 2 MiB. If omitted, the converter uses the
+the fixed base and the selected maximum memory. If an explicit value is not a
+multiple of 2 MiB, the converter rounds it down and reports the requested and
+effective values on standard error. If omitted, the converter uses the
 original
 .B <currentMemory>
 or falls back to
@@ -127,8 +128,11 @@ With
 .BR to\-virtiomem ,
 replaces the input
 .B <memory>
-as the maximum and rounds it down to a multiple of 2 MiB. The domain must not
-already have a virtio-mem device. If the initial memory exceeds the new
+as the requested maximum. The effective maximum is the aligned base plus
+the capacity above it rounded down to whole 2 MiB blocks, regardless of
+option order. For example, a base of 1024 MiB and a requested maximum of
+2049 MiB produce an effective maximum of 2048 MiB. The domain must not
+already have a virtio-mem device. If the initial memory exceeds the requested
 maximum, supply a lower
 .BR \-\-initial\-memory .
 With
@@ -179,10 +183,11 @@ and
 to the static base memory value
 .RB ( \-\-base\-memory ).
 .IP \(bu 2
-Creates or updates
+If no NUMA cells exist, creates
 .B <cpu><numa><cell id='0' .../>
-assigning all static base memory to NUMA node 0 (required by QEMU for
-.BR virtio\-mem ).
+with all static base memory. Otherwise, assigns the remaining base memory to
+the first NUMA cell after subtracting the unchanged allocations of the other
+cells. The conversion fails if no memory remains for the first cell.
 .IP \(bu 2
 Adds a
 .B <memory model='virtio\-mem'>
