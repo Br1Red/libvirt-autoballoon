@@ -1,0 +1,250 @@
+.TH VIRTIOMEM_CONVERT 1 "November 2026" "virtiomem_convert 1.0" "User Commands"
+.SH NAME
+virtiomem_convert \- convert libvirt domain XML configurations between virtio-balloon and virtio-mem
+.SH SYNOPSIS
+.B virtiomem_convert
+.RB [ \-h ]
+.RB [ \-\-vm
+.IR VM_NAME ]
+.RB [ \-c
+.IR URI ]
+.RB [ \-b
+.IR SIZE ]
+.RB [ \-\-dry\-run ]
+.RB [ \-\-color
+.IR WHEN ]
+.I mode
+.RI [ input_xml ]
+.RI [ output_xml ]
+.SH DESCRIPTION
+.B virtiomem_convert
+automates the modification of libvirt/QEMU virtual machine XML configurations to switch between traditional memory ballooning
+.RB ( virtio\-balloon )
+and modern block-based dynamic memory resizing
+.RB ( virtio\-mem ),
+and vice versa.
+.PP
+The tool can operate directly on offline XML files or update a defined domain in libvirt via
+.BR virsh (1)
+when the
+.B \-\-vm
+option is specified. All transformations are idempotent: running the command multiple times on an already converted configuration does not duplicate XML elements, but ensures the balloon parameters remain aligned.
+.SH POSITIONAL ARGUMENTS
+.TP
+.I mode
+Conversion direction. Must be one of:
+.RS
+.TP
+.B to\-virtiomem
+Converts the configuration to use
+.BR virtio\-mem ,
+configuring static base memory, NUMA topology, and the
+.B virtio\-mem
+device.
+.TP
+.B to\-balloon
+Removes
+.B virtio\-mem
+devices, restores full static memory allocation, cleans up single-node NUMA definitions, and re-enables
+.B autodeflate='on'
+on the memory balloon.
+.RE
+.TP
+.I input_xml
+Path to the source XML file to read. Required when
+.B \-\-vm
+is not used; mutually exclusive with
+.BR \-\-vm .
+.TP
+.I output_xml
+Path to the destination XML file to write. Required when neither
+.B \-\-vm
+nor
+.B \-\-dry\-run
+is used.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show a help message and exit.
+.TP
+.BI \-\-vm " VM_NAME"
+Name of the libvirt virtual machine to modify directly via
+.BR virsh (1).
+The virtual machine must be in the
+.B shut off
+state, be persistent, and have no snapshots before running the command.
+.TP
+.BI \-c " URI" "\fR,\fP \-\-connect " URI
+Libvirt connection URI passed to
+.BR virsh (1)
+(for example,
+.I qemu:///system
+or
+.IR qemu:///session ).
+.TP
+.BI \-b " SIZE" "\fR,\fP \-\-base\-memory " SIZE
+Minimum guaranteed static base memory when converting with
+.BR to\-virtiomem .
+Accepts human-readable suffixes such as
+.BR 1G ,
+.BR 1536M ,
+.BR 2GiB ,
+or raw integer values in KiB. The value is rounded down to a multiple of
+.B 2 MiB
+(2048 KiB). Defaults to
+.BR 1GiB .
+.TP
+.B \-\-dry\-run
+Simulate the conversion and print a unified diff of the changes to standard output without modifying the virtual machine or writing any files.
+.TP
+.BI \-\-color " WHEN"
+Control ANSI color output for
+.BR \-\-dry\-run .
+.I WHEN
+can be
+.BR auto ,
+.BR always ,
+or
+.BR never .
+In
+.B auto
+mode (default), colors are enabled if standard output is connected to an interactive terminal (TTY), highlighting added lines in green, removed lines in red, and modified values within corresponding XML tags in bold blue.
+.SH XML TRANSFORMATIONS
+.SS Mode: to-virtiomem
+.IP \(bu 2
+Sets
+.B <maxMemory slots='16' unit='KiB'>
+to the maximum memory aligned to 2 MiB blocks.
+.IP \(bu 2
+Sets
+.B <memory>
+and
+.B <currentMemory>
+to the static base memory value
+.RB ( \-\-base\-memory ).
+.IP \(bu 2
+Creates or updates
+.B <cpu><numa><cell id='0' .../>
+assigning all static base memory to NUMA node 0 (required by QEMU for
+.BR virtio\-mem ).
+.IP \(bu 2
+Adds a
+.B <memory model='virtio\-mem'>
+device with a 2048 KiB block size, setting
+.B <size>
+to the difference between maximum and base memory, and
+.B <requested>
+based on the initial
+.B <currentMemory>
+value.
+.IP \(bu 2
+Removes the
+.B autodeflate
+attribute from
+.B <memballoon>
+and ensures
+.B <stats period='5'/>
+is present.
+.SS Mode: to-balloon
+.IP \(bu 2
+Removes all
+.B <memory model='virtio\-mem'>
+devices and sums their
+.B <size>
+and
+.B <requested>
+values back into the static memory fields.
+.IP \(bu 2
+Restores
+.B <memory>
+to the total maximum memory, updates
+.B <currentMemory>
+to the active amount, and removes
+.BR <maxMemory> .
+.IP \(bu 2
+Removes the
+.B <numa>
+element if it contains a single cell, or updates cell
+.B 0
+in multi-node topologies.
+.IP \(bu 2
+Sets
+.B autodeflate='on'
+and ensures
+.B <stats period='5'/>
+on the
+.B <memballoon>
+device.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+When set to any non-empty value, disables colored output when
+.B \-\-color=auto
+is active.
+.TP
+.B FORCE_COLOR
+When set to a non-empty value (other than
+.BR 0 ),
+forces colored output even if standard output is not a TTY when
+.B \-\-color=auto
+is active.
+.TP
+.B TERM
+If set to
+.BR dumb ,
+disables automatic color detection.
+.SH EXIT STATUS
+.TP
+.B 0
+Successful execution.
+.TP
+.B 1
+Runtime error (e.g., invalid memory format, missing
+.B <memory>
+tag, virtual machine not shut off, or
+.B virsh
+command failure).
+.TP
+.B 2
+Command-line syntax or argument validation error.
+.SH EXAMPLES
+Preview conversion to
+.B virtio\-mem
+on a live domain definition with 2 GiB base memory:
+.PP
+.RS
+.nf
+virtiomem_convert to-virtiomem --vm ubuntu-server -b 2GiB --dry-run
+.fi
+.RE
+.PP
+Apply
+.B virtio\-mem
+to an offline virtual machine using a specific system URI:
+.PP
+.RS
+.nf
+virtiomem_convert to-virtiomem --vm ubuntu-server -c qemu:///system -b 1536M
+.fi
+.RE
+.PP
+Revert a virtual machine back to standard
+.BR virtio\-balloon :
+.PP
+.RS
+.nf
+virtiomem_convert to-balloon --vm ubuntu-server
+.fi
+.RE
+.PP
+Convert a standalone XML file and pipe colored diff output to
+.BR less (1):
+.PP
+.RS
+.nf
+virtiomem_convert to-virtiomem vm_orig.xml --dry-run --color always | less -R
+.fi
+.RE
+.SH SEE ALSO
+.BR virsh (1),
+.BR qemu-system-x86_64 (1)

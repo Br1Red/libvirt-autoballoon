@@ -74,6 +74,52 @@ Monitoring messages list the initial monitored VMs, then only changes:
 when it leaves. Configuration reloads and repeated lifecycle events do not
 repeat these messages for unchanged VMs.
 
+## Converting VM memory XML
+
+`virtiomem_convert` converts libvirt domain XML between `virtio-balloon` and
+`virtio-mem`. It can read and write XML files, or update a VM directly through
+`virsh`. The script requires Python 3.7 or later; `lxml` is optional and
+preserves comments and XML layout when available. `virsh` is required only for
+direct VM operation.
+
+The conversion modes are:
+
+- `to-virtiomem`: sets a fixed base memory and configures a `virtio-mem` device,
+  NUMA topology, and maximum memory. The base defaults to `1GiB` and is rounded
+  down to a multiple of 2 MiB. The generated NUMA cell excludes vCPU IDs
+  explicitly marked `enabled='no'`.
+- `to-balloon`: removes `virtio-mem` devices and restores the VM's memory
+  configuration for `virtio-balloon`.
+
+Convert an XML file and save the result:
+
+```bash
+virtiomem_convert to-virtiomem vm.xml vm-virtiomem.xml --base-memory 2GiB
+```
+
+The output XML is written atomically, so the input and output paths may be the
+same.
+
+Preview the changes without writing a file; `--color` can be `auto`, `always`,
+or `never`:
+
+```bash
+virtiomem_convert to-virtiomem vm.xml --dry-run
+```
+
+To update a VM directly, it must be shut off, persistent, and have no snapshots.
+Preview first, then omit `--dry-run` to apply the conversion. `--connect`
+optionally selects the libvirt URI (otherwise `virsh` uses its default):
+
+```bash
+virtiomem_convert to-virtiomem --vm guest-a --base-memory 2GiB --dry-run
+virtiomem_convert to-virtiomem --vm guest-a --base-memory 2GiB
+virtiomem_convert to-balloon --vm guest-a
+```
+
+Use `virtiomem_convert --help` for all options and `man 1 virtiomem_convert`
+for the manual.
+
 ## Configuration
 
 The configuration file defaults to `/etc/libvirt/autoreclaim.json`. Select a
@@ -491,6 +537,9 @@ status 143, which the supplied systemd unit treats as a successful shutdown.
 
 Requires Python 3 and the `libvirt-python` bindings (for example, the
 `python3-libvirt` package on Debian/Ubuntu).
+`make install` also installs `virtiomem_convert` in `/usr/bin` and its manual
+page in `/usr/share/man/man1`. The converter requires Python 3.7 or later;
+`lxml` is optional, and `virsh` is needed only for direct VM operation.
 
 ```
 ~# make install
