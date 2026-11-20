@@ -580,7 +580,9 @@ For example, idle ratio 0.4 with weight 50 scores 0.8, ahead of idle ratio
 of weight.
 
 Guest memory PSI `some avg10` above 2%, `full avg10` above 0.1%, or active
-swapping vetoes reclaim, including idle reclaim. Swapping counts as active when
+swapping vetoes reclaim, including idle reclaim. At or above twice the guest
+reserve, the daemon reads guest PSI only when a negative PD correction can
+drive host-pressure or idle reclaim. Swapping counts as active when
 `SwapFree` dropped by at least 256 KiB since the previous sample **and** at more
 than 64 KiB/s; smaller or slower drops are treated as noise.
 When `some avg10` is above 0.5% and at most 2%, the reclaim rate is multiplied by

@@ -320,7 +320,6 @@ class AdaptiveControllerTests(unittest.TestCase):
     def test_control_reads_guest_meminfo_once_and_only_reads_psi_on_demand(self):
         self.controller.guest_agents.add("guest-a")
         self.domain.memory = 4194304
-        self.controller.config["default"].update({"pd_kp": 0, "pd_kd": 0})
         files = {
             "/proc/meminfo": "MemTotal: 4194304 kB\nMemAvailable: 1100000 kB\n",
             "/proc/pressure/memory": "some avg10=0.00\nfull avg10=1.01\n",
@@ -336,6 +335,30 @@ class AdaptiveControllerTests(unittest.TestCase):
             self.assertEqual([call.args[1] for call in read_file.call_args_list],
                              ["/proc/meminfo", "/proc/pressure/memory"])
         self.assertEqual(self.domain.calls, [5242880])
+
+    def test_guest_psi_for_reclaim_requires_host_pressure_or_idle_surplus(self):
+        for pressure, idle_threshold, reclaims in (
+                (0, 0.375, False), (0, 0.25, True), (0.5, 1, True),
+                (autoreclaim.HOST_PRESSURE_UNAVAILABLE, 0.25, False)):
+            with self.subTest(pressure=pressure, idle_threshold=idle_threshold):
+                self.domain = Domain()
+                self.domain.memory, self.domain.usable = 4194304, 2097152
+                self.controller.control_samples.clear()
+                self.controller.memory_targets.clear()
+                self.controller.pending_targets.clear()
+                self.controller.config["default"]["idle_reclaim_threshold"] = idle_threshold
+                stats = {**self.domain.memoryStats(), "source": "guest-agent"}
+                with patch.object(self.controller, "host_memory_pressure", return_value=pressure) as host, \
+                        patch.object(self.controller, "_get_guest_agent_memory_pressure",
+                                     return_value=(0, 0)) as psi:
+                    self.controller.process_domainID(self.domain, memstat=stats)
+                host.assert_called_once_with()
+                if reclaims:
+                    psi.assert_called_once_with(self.domain)
+                    self.assertLess(self.domain.memory, 4194304)
+                else:
+                    psi.assert_not_called()
+                    self.assertEqual(self.domain.calls, [])
 
     def test_guest_psi_overrides_negative_pd_and_controls_reclaim(self):
         for some, full, usable, expected in (
@@ -422,11 +445,11 @@ class AdaptiveControllerTests(unittest.TestCase):
         with patch.object(self.controller, "_get_guest_agent_memory_pressure", return_value=(0, 0)) as psi:
             self.controller.process_domainID(self.domain, 0, stats)
             self.controller.process_domainID(self.domain, 1, stats)
-            psi.assert_called_once()
+            psi.assert_not_called()
             self.assertEqual(self.domain.calls, [])
             stats.update(sampled_at=100.6, swap_free=65536 - 5121)
             self.controller.process_domainID(self.domain, 1, stats)
-        self.assertEqual(psi.call_count, 2)
+        psi.assert_not_called()
         self.assertEqual(self.domain.calls, [5242880])
 
     def test_guest_agent_stats_drive_memory_growth(self):

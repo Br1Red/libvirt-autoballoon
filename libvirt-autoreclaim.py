@@ -548,9 +548,18 @@ class LibVirtAutoReclaim:
         delta = parameters.get("pd_kp", 0.5) * error + derivative_term
         emergency = (usable < reserve or used_rate > actual * 0.05
                      or swap_rate > GUEST_SWAP_EMERGENCY_KIB_PER_SEC)
+        reduction_postponed = now < self.manual_increase_until.get(name, 0)
+        reclaim_pressure = 0.0
+        if delta < 0 and not emergency and not reduction_postponed:
+            if host_pressure is None:
+                host_pressure = self.host_memory_pressure()
+            if (host_pressure != HOST_PRESSURE_UNAVAILABLE
+                    and usable - reserve > actual * parameters.get("idle_reclaim_threshold", 0.65)):
+                host_pressure = 1.0
+            reclaim_pressure = max(0.0, host_pressure)
         psi_some = psi_full = None
         low_headroom = usable < 2 * reserve
-        if source == "guest-agent" and (low_headroom or delta < 0):
+        if source == "guest-agent" and (low_headroom or reclaim_pressure > 0):
             psi_some, psi_full = self._get_guest_agent_memory_pressure(dom)
         emergency = emergency or (low_headroom and psi_full is not None and psi_full > 1.0)
         if emergency:
@@ -565,19 +574,13 @@ class LibVirtAutoReclaim:
         floor, reclaim_floor = self._memory_floors(dom, memstat, parameters, backend["type"], bounds)
         dynamic_floor = 0
         if delta < 0:
-            if now < self.manual_increase_until.get(name, 0):
+            if reduction_postponed:
                 logging.debug("%s reduction postponed after an unattributed memory increase", name)
                 return
-            if host_pressure is None:
-                host_pressure = self.host_memory_pressure()
-            if (host_pressure != HOST_PRESSURE_UNAVAILABLE
-                    and usable - reserve > actual * parameters.get("idle_reclaim_threshold", 0.65)):
-                host_pressure = 1.0
-            host_pressure = max(0.0, host_pressure)
             idle_ratio = usable / actual
             weight_multiplier = min(2.0, 100.0 / parameters.get("memory_weight", 100))
             reclaim_limit = (
-                actual * parameters.get("reclaim_ratio", 0.015) * elapsed * host_pressure * idle_ratio
+                actual * parameters.get("reclaim_ratio", 0.015) * elapsed * reclaim_pressure * idle_ratio
                 * weight_multiplier)
             guest_factor = 1.0
             swap_active = (swap_drop >= GUEST_SWAP_VETO_MIN_DROP_KIB
