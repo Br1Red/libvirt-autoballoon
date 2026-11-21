@@ -25,6 +25,8 @@ VM start with QEMU Guest Agent `guest-get-osinfo`. With `--debug`, it logs the
 guest name, detected OS ID and backend OS classification. If identification fails, it
 logs a warning, uses balloon statistics and retries identification every
 60 seconds until the agent responds, allowing for delayed startup in the guest.
+Domain refreshes and the following start event preserve a pending retry to avoid
+duplicate warnings; stopping or crashing the VM clears it.
 Successful identification remains cached until the VM restarts. On other
 identified guests, it reads `MemTotal`, `MemAvailable`, `AnonPages`,
 `Active(file)`, `Inactive(file)`, `SwapTotal`, and `SwapFree` in a single
@@ -115,6 +117,7 @@ times out or the agent disconnects, the daemon keeps tracking it and retries
 the status check. If QGA explicitly reports that the PID is no longer registered
 (`PID ... does not exist`), the daemon discards the PID and cached sample, then
 starts a new collection instead of retrying the lost PID indefinitely.
+This handled condition is logged as a warning without a duplicate libvirt error.
 Other command failures do not invalidate the PID. Failed or
 incomplete samples use fresh balloon statistics when available. For Windows,
 `status` launches one PowerShell sample per VM and waits for completion, checking

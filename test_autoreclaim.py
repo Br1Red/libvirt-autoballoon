@@ -2322,6 +2322,22 @@ class LifecycleTests(unittest.TestCase):
                 if not debug:
                     self.assertEqual(errors.getvalue(), "")
 
+    def test_libvirt_handler_hides_only_missing_guest_exec_pid_errors(self):
+        for pid in ("42", "-1", "lld", "ld", "I64d"):
+            with self.subTest(pid=pid), patch.object(autoreclaim.logging, "error") as error:
+                autoreclaim.report_libvirt_error(
+                    "start", (113, 10, f"comando guest agent fallito: PID {pid} does not exist", 2))
+                error.assert_not_called()
+        for code, message in (
+                (42, "PID 42 does not exist"),
+                (113, "guest command failed"),
+                (113, "PID 42 does not exist: another failure"),
+                (113, "PID unknown does not exist")):
+            with self.subTest(code=code, message=message), \
+                    patch.object(autoreclaim.logging, "error") as error:
+                autoreclaim.report_libvirt_error("start", (code, 10, message, 2))
+                error.assert_called_once_with("libvirt: %s", message)
+
     def test_new_domains_follow_selection_and_xml_requirements(self):
         for event in (self.libvirt.VIR_DOMAIN_EVENT_DEFINED,
                       self.libvirt.VIR_DOMAIN_EVENT_STARTED,
@@ -2393,6 +2409,34 @@ class LifecycleTests(unittest.TestCase):
         proc.assert_not_called()
         self.assertEqual(stats["source"], "balloon")
         self.assertIsNone(self.controller.vm_backends["guest-new"]["os"])
+
+    def test_start_preserves_pending_os_retry_from_domain_refresh(self):
+        self.domain.XMLDesc.return_value = (
+            "<domain><devices>"
+            "<channel type='unix'><target name='org.qemu.guest_agent.0'/></channel>"
+            "<memballoon autodeflate='on'><stats period='2'/></memballoon>"
+            "</devices></domain>")
+        self.qemu_agent.side_effect = self.libvirt.libvirtError("agent not ready")
+        with patch.object(autoreclaim, "monotonic", return_value=100), \
+                self.assertLogs(level="WARNING") as logs:
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
+            self.controller.dom_print_names()
+            self.controller._get_guest_memstats(self.domain)
+        self.assertEqual(self.qemu_agent.call_count, 1)
+        self.assertEqual(len(logs.records), 1)
+        with patch.object(autoreclaim, "monotonic", return_value=159):
+            self.controller._get_guest_memstats(self.domain)
+        self.assertEqual(self.qemu_agent.call_count, 1)
+        with patch.object(autoreclaim, "monotonic", return_value=160), \
+                self.assertLogs(level="WARNING"):
+            self.controller._get_guest_memstats(self.domain)
+        self.assertEqual(self.qemu_agent.call_count, 2)
+        with patch.object(autoreclaim, "monotonic", return_value=161), \
+                self.assertLogs(level="WARNING"):
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STOPPED)
+            self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STARTED)
+        self.assertEqual(self.qemu_agent.call_count, 3)
 
     def test_delayed_guest_agent_is_detected_after_retry_interval(self):
         self.controller.vm_backends["guest-new"] = {

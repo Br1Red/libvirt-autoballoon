@@ -1182,8 +1182,10 @@ class LibVirtAutoReclaim:
                 self.windows_agent_state.pop(dom.name(), None)
                 self.__forget_domain(dom.name())
             elif event == libvirt.VIR_DOMAIN_EVENT_STARTED:
-                self.guest_os.pop(dom.name(), None)
-                self.guest_os_retry_at.pop(dom.name(), None)
+                # A preceding refresh may already have scheduled an OS retry.
+                if self.guest_os.get(dom.name()) is not None:
+                    self.guest_os.pop(dom.name(), None)
+                    self.guest_os_retry_at.pop(dom.name(), None)
                 self.windows_agent_state.pop(dom.name(), None)
                 self.control_samples.pop(dom.name(), None)
                 self.last_poll_times.pop(dom.name(), None)
@@ -1437,9 +1439,11 @@ def report_libvirt_error(context, error):
     code, _, message, level = error[:4]
     if (code == libvirt.VIR_ERR_AGENT_UNRESPONSIVE
             or code == getattr(libvirt, "VIR_ERR_AGENT_COMMAND_TIMEOUT", None)
-            or (context == "status"
-                and code == getattr(libvirt, "VIR_ERR_AGENT_COMMAND_FAILED", None))):
-        # The guest-agent reader already reports the exception at debug level.
+            or (code == getattr(libvirt, "VIR_ERR_AGENT_COMMAND_FAILED", None)
+                and (context == "status"
+                     or (isinstance(message, str)
+                         and GUEST_EXEC_PID_NOT_FOUND_PATTERN.search(message))))):
+        # The guest-agent reader already reports the handled exception.
         return
     log = logging.warning if level == libvirt.VIR_ERR_WARNING else logging.error
     log("libvirt: %s", message)
