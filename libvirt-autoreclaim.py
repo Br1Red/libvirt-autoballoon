@@ -1437,13 +1437,14 @@ def handle_sigterm(signum, _frame):
 
 def report_libvirt_error(context, error):
     code, _, message, level = error[:4]
-    if (code == libvirt.VIR_ERR_AGENT_UNRESPONSIVE
+    if (code == getattr(libvirt, "VIR_ERR_NO_DOMAIN", None)
+            or code == libvirt.VIR_ERR_AGENT_UNRESPONSIVE
             or code == getattr(libvirt, "VIR_ERR_AGENT_COMMAND_TIMEOUT", None)
             or (code == getattr(libvirt, "VIR_ERR_AGENT_COMMAND_FAILED", None)
                 and (context == "status"
                      or (isinstance(message, str)
                          and GUEST_EXEC_PID_NOT_FOUND_PATTERN.search(message))))):
-        # The guest-agent reader already reports the handled exception.
+        # Domain and guest-agent callers already report the handled exception.
         return
     log = logging.warning if level == libvirt.VIR_ERR_WARNING else logging.error
     log("libvirt: %s", message)

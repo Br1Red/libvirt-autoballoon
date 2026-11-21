@@ -322,6 +322,8 @@ If no other statistics are
 available, `Backend` uses `unavailable` as the source. Other warnings and
 errors remain visible on standard error. The `start` command logs daemon events
 and memory adjustments to standard error; the `status` table uses standard output.
+If a VM stops between active-domain enumeration and lookup, polling logs a
+single warning and skips it without a duplicate libvirt error.
 Informational messages have no level prefix; other log levels retain their
 prefixes (`DEBUG`, `WARNING`, `ERROR`).
 Controller debug messages use the same source/method labels as `Backend`, for

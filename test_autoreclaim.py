@@ -2135,6 +2135,7 @@ class LifecycleTests(unittest.TestCase):
             VIR_DOMAIN_EVENT_STOPPED=5,
             VIR_DOMAIN_EVENT_CRASHED=8,
             VIR_DOMAIN_EVENT_ID_LIFECYCLE=0,
+            VIR_ERR_NO_DOMAIN=42,
             VIR_ERR_AGENT_UNRESPONSIVE=86,
             VIR_ERR_AGENT_COMMAND_TIMEOUT=112,
             VIR_ERR_AGENT_COMMAND_FAILED=113,
@@ -2257,7 +2258,7 @@ class LifecycleTests(unittest.TestCase):
             if json.loads(command)["execute"] == "guest-get-osinfo":
                 return '{"return": {"id": "linux"}}'
             report = self.libvirt.registerErrorHandler.call_args
-            for code, message in ((42, "Unrelated libvirt failure"),
+            for code, message in ((55, "Unrelated libvirt failure"),
                                   (agent_code, "Guest agent unavailable")):
                 if report is None:
                     print(message, file=sys.stderr)
@@ -2329,7 +2330,7 @@ class LifecycleTests(unittest.TestCase):
                     "start", (113, 10, f"comando guest agent fallito: PID {pid} does not exist", 2))
                 error.assert_not_called()
         for code, message in (
-                (42, "PID 42 does not exist"),
+                (55, "PID 42 does not exist"),
                 (113, "guest command failed"),
                 (113, "PID 42 does not exist: another failure"),
                 (113, "PID unknown does not exist")):
@@ -2844,6 +2845,28 @@ class LifecycleTests(unittest.TestCase):
         with self.assertLogs(level="WARNING") as logs:
             self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_DEFINED)
         self.assertIn("domain disappeared", logs.output[0])
+
+    def test_domain_disappearing_during_polling_logs_only_one_warning(self):
+        self.controller.dom_print_names()
+        self.conn.listDomainsID.return_value = [88]
+        message = "Domain not found: no domain with matching id 88"
+
+        def disappeared(domain_id):
+            autoreclaim.report_libvirt_error(
+                "start", (self.libvirt.VIR_ERR_NO_DOMAIN, 10, message, 2))
+            raise self.libvirt.libvirtError(message)
+
+        self.conn.lookupByID.side_effect = disappeared
+        with patch.object(self.controller, "process_domainID") as process, \
+                self.assertLogs(level="WARNING") as logs:
+            self.controller.process_domains()
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(logs.records[0].levelno, autoreclaim.logging.WARNING)
+        self.assertIn("88 stopped or unavailable, skipping", logs.output[0])
+        process.assert_not_called()
+        self.lifecycle(self.libvirt.VIR_DOMAIN_EVENT_STOPPED)
+        self.assertNotIn("guest-new", self.controller.monitored_vms)
+        self.assertFalse(self.controller.polling_active)
 
     def test_daemon_suspends_polling_until_start_event_and_after_last_stop(self):
         self.conn.domainEventRegisterAny.return_value = 3
