@@ -212,7 +212,7 @@ repeat these messages for unchanged VMs.
 
 ## Converting VM memory XML
 
-`virtiomem_convert` converts libvirt domain XML between `virtio-balloon` and
+`libvirt-mem-convert` converts libvirt domain XML between `virtio-balloon` and
 `virtio-mem`. It can read and write XML files, or update a VM directly through
 `virsh`. The script requires Python 3.7 or later and uses the Python standard
 library to process XML. `virsh` is required only for direct VM operation.
@@ -237,7 +237,7 @@ The conversion modes are:
 Convert an XML file and save the result:
 
 ```bash
-virtiomem_convert to-virtiomem vm.xml vm-virtiomem.xml --base-memory 2GiB
+libvirt-mem-convert to-virtiomem vm.xml vm-virtiomem.xml --base-memory 2GiB
 ```
 
 With `to-virtiomem`, use `--initial-memory 3GiB` (or `-i 3GiB`) to start with
@@ -266,7 +266,7 @@ also specify a lower `--initial-memory`.
 To keep the existing balloon model during conversion:
 
 ```bash
-virtiomem_convert to-virtiomem vm.xml vm-virtiomem.xml -k
+libvirt-mem-convert to-virtiomem vm.xml vm-virtiomem.xml -k
 ```
 
 The output XML is written atomically, so the input and output paths may be the
@@ -277,7 +277,7 @@ Preview the changes without writing a file with `-n` (`--dry-run`).
 Use `-L` (`--color`) with `auto`, `always`, or `never`:
 
 ```bash
-virtiomem_convert to-virtiomem vm.xml -n -L always
+libvirt-mem-convert to-virtiomem vm.xml -n -L always
 ```
 
 To update a VM directly with `-V` (`--vm`), it must be shut off, persistent,
@@ -286,12 +286,12 @@ and have no snapshots. Preview first, then omit `-n` to apply the conversion.
 default):
 
 ```bash
-virtiomem_convert to-virtiomem -V guest-a --base-memory 2GiB -n
-virtiomem_convert to-virtiomem --vm guest-a --base-memory 2GiB
-virtiomem_convert to-balloon --vm guest-a
+libvirt-mem-convert to-virtiomem -V guest-a --base-memory 2GiB -n
+libvirt-mem-convert to-virtiomem --vm guest-a --base-memory 2GiB
+libvirt-mem-convert to-balloon --vm guest-a
 ```
 
-Use `virtiomem_convert --help` for all options and `man 1 virtiomem_convert`
+Use `libvirt-mem-convert --help` for all options and `man 1 libvirt-mem-convert`
 for the manual.
 
 ## Configuration
@@ -806,9 +806,11 @@ process.
 
 Requires Python 3 and the `libvirt-python` bindings (for example, the
 `python3-libvirt` package on Debian/Ubuntu).
-`make install` also installs `virtiomem_convert` in `/usr/bin` and its manual
+`make install` also installs `libvirt-mem-convert` in `/usr/bin` and its manual
 page in `/usr/share/man/man1`. The converter requires Python 3.7 or later.
 `virsh` is needed only for direct VM operation.
+When upgrading from the previous command name, uninstall the previous version
+first to remove its executable and manual page; no compatibility alias is installed.
 
 ```
 ~# make install

@@ -657,7 +657,9 @@ def process_vm(
             os.remove(tmp_path)
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert libvirt XML between virtio-balloon and virtio-mem.')
+    parser = argparse.ArgumentParser(
+        prog='libvirt-mem-convert',
+        description='Convert libvirt XML between virtio-balloon and virtio-mem.')
     parser.add_argument('mode', choices=['to-virtiomem', 'to-balloon'], help='Conversion direction')
     parser.add_argument('input_xml', nargs='?', help='Path to the input XML file (unless --vm is used)')
     parser.add_argument('output_xml', nargs='?', help='Path to the output XML file (not needed with --vm or --dry-run)')

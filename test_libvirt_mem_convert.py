@@ -1,25 +1,30 @@
+import importlib.util
 import io
 import os
 import stat
+import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ElementTree
 from unittest.mock import call, patch
 
-import virtiomem_convert
+spec = importlib.util.spec_from_file_location('libvirt_mem_convert', 'libvirt-mem-convert.py')
+libvirt_mem_convert = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = libvirt_mem_convert
+spec.loader.exec_module(libvirt_mem_convert)
 
 
-class VirtioMemConvertTests(unittest.TestCase):
+class LibvirtMemConvertTests(unittest.TestCase):
     def test_missing_memory_text_raises_value_error(self):
         for value in (None, '', '   '):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, 'Memory value'):
-                    virtiomem_convert.to_kib(value, 'KiB')
+                    libvirt_mem_convert.to_kib(value, 'KiB')
 
     def test_empty_memory_element_reports_value_error(self):
         xml = '<domain><memory/><currentMemory>1024</currentMemory></domain>'
         with self.assertRaisesRegex(ValueError, 'Memory value is missing'):
-            virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 2048)
+            libvirt_mem_convert.transform_xml_string(xml, 'to-virtiomem', 2048)
 
     def test_to_virtiomem_disables_balloon_by_default(self):
         xml = """<domain>
@@ -33,7 +38,7 @@ class VirtioMemConvertTests(unittest.TestCase):
   </devices>
 </domain>"""
 
-        result = virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
+        result = libvirt_mem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
         balloon = ElementTree.fromstring(result).find('devices/memballoon')
 
         self.assertEqual(balloon.get('model'), 'none')
@@ -48,7 +53,7 @@ class VirtioMemConvertTests(unittest.TestCase):
   <devices><memballoon model='virtio'/></devices>
 </domain>"""
 
-        result = virtiomem_convert.transform_xml_string(
+        result = libvirt_mem_convert.transform_xml_string(
             xml, 'to-virtiomem', 1048576, keep_balloon=True
         )
         balloon = ElementTree.fromstring(result).find('devices/memballoon')
@@ -68,7 +73,7 @@ class VirtioMemConvertTests(unittest.TestCase):
   </devices>
 </domain>"""
 
-        result = virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
+        result = libvirt_mem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
         root = ElementTree.fromstring(result)
 
         self.assertEqual(len(root.findall("devices/memory[@model='virtio-mem']")), 1)
@@ -82,7 +87,7 @@ class VirtioMemConvertTests(unittest.TestCase):
         )
         for keep_balloon, expected_model in ((False, 'none'), (True, 'virtio')):
             with self.subTest(keep_balloon=keep_balloon):
-                result = virtiomem_convert.transform_xml_string(
+                result = libvirt_mem_convert.transform_xml_string(
                     xml, 'to-virtiomem', 1048576, keep_balloon=keep_balloon
                 )
                 balloon = ElementTree.fromstring(result).find('devices/memballoon')
@@ -104,13 +109,13 @@ class VirtioMemConvertTests(unittest.TestCase):
     </memory>
   </devices>
 </domain>"""
-        result = virtiomem_convert.transform_xml_string(xml, 'to-balloon', 1048576)
+        result = libvirt_mem_convert.transform_xml_string(xml, 'to-balloon', 1048576)
         root = ElementTree.fromstring(result)
 
         self.assertEqual(root.findtext('memory'), '8388608')
         self.assertEqual(root.findtext('currentMemory'), '2621440')
 
-        result = virtiomem_convert.transform_xml_string(
+        result = libvirt_mem_convert.transform_xml_string(
             xml, 'to-balloon', 1048576, initial_kib=3145729
         )
         root = ElementTree.fromstring(result)
@@ -123,7 +128,7 @@ class VirtioMemConvertTests(unittest.TestCase):
             "<cell id='0' cpus='0-1' memory='512' unit='MiB'/>"
             "<cell id='1' cpus='2-3' memory='524288' unit='KiB'/>",
         )
-        result = virtiomem_convert.transform_xml_string(multi_node_xml, 'to-balloon', 1048576)
+        result = libvirt_mem_convert.transform_xml_string(multi_node_xml, 'to-balloon', 1048576)
         root = ElementTree.fromstring(result)
         self.assertEqual(root.findtext('memory'), '8388608')
         self.assertEqual(root.findtext('currentMemory'), '2621440')
@@ -134,7 +139,7 @@ class VirtioMemConvertTests(unittest.TestCase):
 
     def test_to_balloon_initial_memory_creates_current_memory_and_checks_limits(self):
         xml = "<domain><memory unit='GiB'>8</memory></domain>"
-        result = virtiomem_convert.transform_xml_string(
+        result = libvirt_mem_convert.transform_xml_string(
             xml, 'to-balloon', 1048576, initial_kib=2621440
         )
         root = ElementTree.fromstring(result)
@@ -143,7 +148,7 @@ class VirtioMemConvertTests(unittest.TestCase):
         for value in (0, 8388609):
             with self.subTest(initial_kib=value):
                 with self.assertRaisesRegex(ValueError, 'Initial memory must be positive'):
-                    virtiomem_convert.transform_xml_string(
+                    libvirt_mem_convert.transform_xml_string(
                         xml, 'to-balloon', 1048576, initial_kib=value
                     )
 
@@ -165,7 +170,7 @@ class VirtioMemConvertTests(unittest.TestCase):
                     "<memballoon model='none'/></devices></domain>"
                 )
 
-                result = virtiomem_convert.transform_xml_string(xml, 'to-balloon', 1048576)
+                result = libvirt_mem_convert.transform_xml_string(xml, 'to-balloon', 1048576)
                 balloon = ElementTree.fromstring(result).find('devices/memballoon')
 
                 self.assertEqual(balloon.get('model'), 'virtio')
@@ -186,9 +191,9 @@ class VirtioMemConvertTests(unittest.TestCase):
 
             with patch(
                 'sys.argv',
-                ['virtiomem_convert.py', 'to-virtiomem', input_path, output_path, '-k'],
+                ['libvirt-mem-convert.py', 'to-virtiomem', input_path, output_path, '-k'],
             ):
-                virtiomem_convert.main()
+                libvirt_mem_convert.main()
 
             with open(output_path, 'r', encoding='utf-8') as xml_file:
                 root = ElementTree.parse(xml_file).getroot()
@@ -198,11 +203,11 @@ class VirtioMemConvertTests(unittest.TestCase):
         with patch(
             'sys.argv',
             [
-                'virtiomem_convert.py', 'to-virtiomem', '-V', 'guest-a',
+                'libvirt-mem-convert.py', 'to-virtiomem', '-V', 'guest-a',
                 '--keep-balloon', '-i', '2GiB', '-m', '6GiB', '-n', '-L', 'always',
             ],
-        ), patch.object(virtiomem_convert, 'process_vm') as process_vm:
-            virtiomem_convert.main()
+        ), patch.object(libvirt_mem_convert, 'process_vm') as process_vm:
+            libvirt_mem_convert.main()
 
         process_vm.assert_called_once_with(
             'guest-a',
@@ -222,7 +227,7 @@ class VirtioMemConvertTests(unittest.TestCase):
             "<currentMemory unit='GiB'>3</currentMemory></domain>"
         )
         base_kib = 1048576
-        virtio_xml = virtiomem_convert.transform_xml_string(
+        virtio_xml = libvirt_mem_convert.transform_xml_string(
             xml, 'to-virtiomem', base_kib, max_override_kib=6291457
         )
         root = ElementTree.fromstring(virtio_xml)
@@ -231,10 +236,10 @@ class VirtioMemConvertTests(unittest.TestCase):
         self.assertEqual(root.findtext('devices/memory/target/requested'), '2097152')
 
         with self.assertRaisesRegex(ValueError, 'exceeds --max-memory'):
-            virtiomem_convert.transform_xml_string(
+            libvirt_mem_convert.transform_xml_string(
                 virtio_xml, 'to-balloon', base_kib, max_override_kib=2097153
             )
-        balloon_xml = virtiomem_convert.transform_xml_string(
+        balloon_xml = libvirt_mem_convert.transform_xml_string(
             virtio_xml, 'to-balloon', base_kib, initial_kib=1572864, max_override_kib=2097153
         )
         root = ElementTree.fromstring(balloon_xml)
@@ -243,7 +248,7 @@ class VirtioMemConvertTests(unittest.TestCase):
 
     def test_max_memory_updates_already_ballooned_domain(self):
         xml = "<domain><memory unit='GiB'>4</memory><currentMemory unit='GiB'>2</currentMemory></domain>"
-        result = virtiomem_convert.transform_xml_string(
+        result = libvirt_mem_convert.transform_xml_string(
             xml, 'to-balloon', 1048576, max_override_kib=3145728
         )
         root = ElementTree.fromstring(result)
@@ -268,7 +273,7 @@ class VirtioMemConvertTests(unittest.TestCase):
         ):
             with self.subTest(initial_kib=initial_kib):
                 with patch('sys.stderr', new_callable=io.StringIO) as stderr:
-                    result = virtiomem_convert.transform_xml_string(
+                    result = libvirt_mem_convert.transform_xml_string(
                         xml, 'to-virtiomem', 1048576, initial_kib=initial_kib
                     )
                 self.assertEqual(stderr.getvalue(), expected_warning)
@@ -283,7 +288,7 @@ class VirtioMemConvertTests(unittest.TestCase):
         for initial_kib in (1048575, 4194305):
             with self.subTest(initial_kib=initial_kib):
                 with self.assertRaisesRegex(ValueError, 'Initial memory must be between'):
-                    virtiomem_convert.transform_xml_string(
+                    libvirt_mem_convert.transform_xml_string(
                         xml, 'to-virtiomem', 1048576, initial_kib=initial_kib
                     )
 
@@ -300,7 +305,7 @@ class VirtioMemConvertTests(unittest.TestCase):
         memory.text = '2048'
         memory.tail = '\n'
 
-        virtiomem_convert.remove_child_formatted(root, max_memory)
+        libvirt_mem_convert.remove_child_formatted(root, max_memory)
 
         self.assertEqual(
             ElementTree.tostring(root, encoding='unicode'),
@@ -311,13 +316,13 @@ class VirtioMemConvertTests(unittest.TestCase):
         minus_lines = ['-old line\n'] * 51
         plus_lines = ['+new line\n'] * 50
 
-        with patch('virtiomem_convert.difflib.SequenceMatcher', side_effect=AssertionError):
-            colored_minus, colored_plus = virtiomem_convert.align_hunk_lines(minus_lines, plus_lines)
+        with patch('libvirt_mem_convert.difflib.SequenceMatcher', side_effect=AssertionError):
+            colored_minus, colored_plus = libvirt_mem_convert.align_hunk_lines(minus_lines, plus_lines)
 
         self.assertEqual(len(colored_minus), len(minus_lines))
         self.assertEqual(len(colored_plus), len(plus_lines))
-        self.assertTrue(colored_minus[0].startswith(virtiomem_convert.ANSI_RED))
-        self.assertTrue(colored_plus[0].startswith(virtiomem_convert.ANSI_GREEN))
+        self.assertTrue(colored_minus[0].startswith(libvirt_mem_convert.ANSI_RED))
+        self.assertTrue(colored_plus[0].startswith(libvirt_mem_convert.ANSI_GREEN))
 
     def test_conversion_preserves_qemu_namespace_prefix(self):
         xml = """<domain xmlns:qemu='http://libvirt.org'>
@@ -335,7 +340,7 @@ class VirtioMemConvertTests(unittest.TestCase):
   <qemu:commandline><qemu:arg value='-foo'/></qemu:commandline>
 </domain>"""
 
-        result = virtiomem_convert.transform_xml_string(xml, 'to-balloon', 1024)
+        result = libvirt_mem_convert.transform_xml_string(xml, 'to-balloon', 1024)
 
         self.assertIn('<qemu:commandline>', result)
         self.assertIn('<qemu:arg ', result)
@@ -350,7 +355,7 @@ class VirtioMemConvertTests(unittest.TestCase):
   <description note="it's intact">Guest</description>
 </domain>"""
 
-        result = virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
+        result = libvirt_mem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
 
         self.assertIn('<!-- keep "this" comment and its <markup> -->', result)
         self.assertIn('<?example test="value"?>', result)
@@ -362,7 +367,7 @@ class VirtioMemConvertTests(unittest.TestCase):
             '<metadata><info xmlns="urn:example"/></metadata></domain>'
         )
 
-        result = virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
+        result = libvirt_mem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
 
         root = ElementTree.fromstring(result)
         self.assertEqual(root.tag, 'domain')
@@ -378,7 +383,7 @@ class VirtioMemConvertTests(unittest.TestCase):
   </numa></cpu>
 </domain>"""
 
-        result = virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
+        result = libvirt_mem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
 
         root = ElementTree.fromstring(result)
         first, second = root.findall('cpu/numa/cell')
@@ -387,7 +392,7 @@ class VirtioMemConvertTests(unittest.TestCase):
         self.assertEqual(second.attrib, {'id': '1', 'cpus': '2-3', 'memory': '512', 'unit': 'MiB'})
 
         with self.assertRaisesRegex(ValueError, '524288 KiB memory allocation leaves no room for the first NUMA cell'):
-            virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 524288)
+            libvirt_mem_convert.transform_xml_string(xml, 'to-virtiomem', 524288)
 
     def test_numa_cpu_set_excludes_disabled_vcpus(self):
         xml = """<domain>
@@ -406,7 +411,7 @@ class VirtioMemConvertTests(unittest.TestCase):
   <devices/>
 </domain>"""
 
-        result = virtiomem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
+        result = libvirt_mem_convert.transform_xml_string(xml, 'to-virtiomem', 1048576)
 
         root = ElementTree.fromstring(result)
         self.assertEqual(root.find('cpu/numa/cell').get('cpus'), '0,2')
@@ -425,9 +430,9 @@ class VirtioMemConvertTests(unittest.TestCase):
 
             with patch(
                 'sys.argv',
-                ['virtiomem_convert.py', 'to-virtiomem', path, path],
+                ['libvirt-mem-convert.py', 'to-virtiomem', path, path],
             ):
-                virtiomem_convert.main()
+                libvirt_mem_convert.main()
 
             with open(path, 'r', encoding='utf-8') as xml_file:
                 result = ElementTree.parse(xml_file).getroot()
@@ -441,8 +446,8 @@ class VirtioMemConvertTests(unittest.TestCase):
             with open(reference, 'w', encoding='utf-8'):
                 pass
 
-            with patch.object(virtiomem_convert.os, 'umask', side_effect=AssertionError('umask changed')):
-                virtiomem_convert.write_xml_atomically(path, '<domain/>')
+            with patch.object(libvirt_mem_convert.os, 'umask', side_effect=AssertionError('umask changed')):
+                libvirt_mem_convert.write_xml_atomically(path, '<domain/>')
 
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), stat.S_IMODE(os.stat(reference).st_mode))
             self.assertCountEqual(os.listdir(directory), ['domain.xml', 'reference.xml'])
@@ -453,9 +458,9 @@ class VirtioMemConvertTests(unittest.TestCase):
             with open(path, 'w', encoding='utf-8') as xml_file:
                 xml_file.write('original')
 
-            with patch.object(virtiomem_convert.os, 'replace', side_effect=OSError('replace failed')):
+            with patch.object(libvirt_mem_convert.os, 'replace', side_effect=OSError('replace failed')):
                 with self.assertRaisesRegex(OSError, 'replace failed'):
-                    virtiomem_convert.write_xml_atomically(path, 'replacement')
+                    libvirt_mem_convert.write_xml_atomically(path, 'replacement')
 
             with open(path, 'r', encoding='utf-8') as xml_file:
                 self.assertEqual(xml_file.read(), 'original')
@@ -463,12 +468,12 @@ class VirtioMemConvertTests(unittest.TestCase):
 
     def test_process_vm_rejects_nonpersistent_domains(self):
         with patch.object(
-            virtiomem_convert,
+            libvirt_mem_convert,
             'run_virsh',
             side_effect=['shut off', 'Name: guest-a\nPersistent: no\n'],
         ) as run_virsh:
             with self.assertRaisesRegex(RuntimeError, 'not persistent'):
-                virtiomem_convert.process_vm('guest-a', 'to-virtiomem', 1048576)
+                libvirt_mem_convert.process_vm('guest-a', 'to-virtiomem', 1048576)
 
         self.assertEqual(
             run_virsh.call_args_list,
@@ -477,12 +482,12 @@ class VirtioMemConvertTests(unittest.TestCase):
 
     def test_process_vm_rejects_domains_with_snapshots(self):
         with patch.object(
-            virtiomem_convert,
+            libvirt_mem_convert,
             'run_virsh',
             side_effect=['shut off', 'Persistent: yes\n', 'snapshot-a\n'],
         ) as run_virsh:
             with self.assertRaisesRegex(RuntimeError, 'has snapshots'):
-                virtiomem_convert.process_vm('guest-a', 'to-virtiomem', 1048576)
+                libvirt_mem_convert.process_vm('guest-a', 'to-virtiomem', 1048576)
 
         self.assertEqual(
             run_virsh.call_args_list,
@@ -495,11 +500,11 @@ class VirtioMemConvertTests(unittest.TestCase):
 
     def test_process_vm_proceeds_for_persistent_domain_without_snapshots(self):
         with patch.object(
-            virtiomem_convert,
+            libvirt_mem_convert,
             'run_virsh',
             side_effect=['shut off', 'Persistent: yes\n', '', '<domain/>', ''],
-        ) as run_virsh, patch.object(virtiomem_convert, 'transform_xml_string', return_value='<domain/>'):
-            virtiomem_convert.process_vm('guest-a', 'to-virtiomem', 1048576)
+        ) as run_virsh, patch.object(libvirt_mem_convert, 'transform_xml_string', return_value='<domain/>'):
+            libvirt_mem_convert.process_vm('guest-a', 'to-virtiomem', 1048576)
 
         self.assertEqual(run_virsh.call_args_list[:4], [
             call(['domstate', 'guest-a'], None),

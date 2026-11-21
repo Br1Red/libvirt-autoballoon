@@ -1,8 +1,8 @@
-.TH VIRTIOMEM_CONVERT 1 "November 2026" "virtiomem_convert 1.0" "User Commands"
+.TH LIBVIRT-MEM-CONVERT 1 "November 2026" "libvirt-mem-convert 1.0" "User Commands"
 .SH NAME
-virtiomem_convert \- convert libvirt domain XML configurations between virtio-balloon and virtio-mem
+libvirt-mem-convert \- convert libvirt domain XML configurations between virtio-balloon and virtio-mem
 .SH SYNOPSIS
-.B virtiomem_convert
+.B libvirt-mem-convert
 .RB [ \-h ]
 .RB [ \-c
 .IR URI ]
@@ -22,7 +22,7 @@ virtiomem_convert \- convert libvirt domain XML configurations between virtio-ba
 .RI [ input_xml ]
 .RI [ output_xml ]
 .SH DESCRIPTION
-.B virtiomem_convert
+.B libvirt-mem-convert
 automates the modification of libvirt/QEMU virtual machine XML configurations to switch between traditional memory ballooning
 .RB ( virtio\-balloon )
 and modern block-based dynamic memory resizing
@@ -289,7 +289,7 @@ on a live domain definition with 2 GiB base memory:
 .PP
 .RS
 .nf
-virtiomem_convert to-virtiomem --vm ubuntu-server -b 2GiB --dry-run
+libvirt-mem-convert to-virtiomem --vm ubuntu-server -b 2GiB --dry-run
 .fi
 .RE
 .PP
@@ -299,7 +299,7 @@ to an offline virtual machine using a specific system URI:
 .PP
 .RS
 .nf
-virtiomem_convert to-virtiomem --vm ubuntu-server -c qemu:///system -b 1536M
+libvirt-mem-convert to-virtiomem --vm ubuntu-server -c qemu:///system -b 1536M
 .fi
 .RE
 .PP
@@ -308,7 +308,7 @@ Revert a virtual machine back to standard
 .PP
 .RS
 .nf
-virtiomem_convert to-balloon --vm ubuntu-server
+libvirt-mem-convert to-balloon --vm ubuntu-server
 .fi
 .RE
 .PP
@@ -317,7 +317,7 @@ Convert a standalone XML file and pipe colored diff output to
 .PP
 .RS
 .nf
-virtiomem_convert to-virtiomem vm_orig.xml --dry-run --color always | less -R
+libvirt-mem-convert to-virtiomem vm_orig.xml --dry-run --color always | less -R
 .fi
 .RE
 .SH SEE ALSO
