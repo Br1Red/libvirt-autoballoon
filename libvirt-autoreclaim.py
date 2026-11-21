@@ -7,6 +7,7 @@ import argparse
 import logging
 import math
 import os
+import re
 import signal
 import xml.etree.ElementTree as ET
 import libvirt
@@ -26,6 +27,8 @@ GUEST_SWAP_VETO_KIB_PER_SEC = 64
 GUEST_SWAP_VETO_MIN_DROP_KIB = 256
 GUEST_OS_RETRY_INTERVAL = 60
 WINDOWS_STATUS_TIMEOUT = 5
+# Some QGA versions print PRId64 literally instead of the PID.
+GUEST_EXEC_PID_NOT_FOUND_PATTERN = re.compile(r"\bPID (?:-?\d+|lld|ld|I64d) does not exist$")
 WINDOWS_MEMORY_COMMAND = (
     "$ErrorActionPreference='Stop'; "
     "$os=Get-CimInstance Win32_OperatingSystem; "
@@ -94,6 +97,9 @@ class MemorySample(NamedTuple):
 class ExitFailure(Exception):
     pass
 
+class GuestExecPIDNotFound(ValueError):
+    pass
+
 def cleanup_libvirt(operation, *args):
     try:
         operation(*args)
@@ -105,6 +111,11 @@ class LogFormatter(logging.Formatter):
         if record.levelno == logging.INFO:
             return record.message
         return super().formatMessage(record)
+
+def format_backend_label(source, method):
+    source = "agent" if source == "guest-agent" else source or "unavailable"
+    method = "agent" if method == "guest-agent" else method
+    return source if source == method else f"{source}/{method}"
 
 class LibVirtAutoReclaim:
     poll_interval = 5
@@ -267,8 +278,24 @@ class LibVirtAutoReclaim:
         request = {"execute": command}
         if arguments is not None:
             request["arguments"] = arguments
-        response = json.loads(libvirt_qemu.qemuAgentCommand(dom, json.dumps(request), 1, 0))
+        try:
+            raw_response = libvirt_qemu.qemuAgentCommand(dom, json.dumps(request), 1, 0)
+        except libvirt.libvirtError as error:
+            get_error_code = getattr(error, "get_error_code", None)
+            command_failed = getattr(libvirt, "VIR_ERR_AGENT_COMMAND_FAILED", None)
+            if (command == "guest-exec-status" and command_failed is not None
+                    and callable(get_error_code) and get_error_code() == command_failed
+                    and GUEST_EXEC_PID_NOT_FOUND_PATTERN.search(str(error))):
+                raise GuestExecPIDNotFound(str(error)) from error
+            raise
+        response = json.loads(raw_response)
         if isinstance(response, dict) and "error" in response:
+            agent_error = response["error"]
+            if (command == "guest-exec-status" and isinstance(agent_error, dict)
+                    and agent_error.get("class") == "GenericError"
+                    and isinstance(agent_error.get("desc"), str)
+                    and GUEST_EXEC_PID_NOT_FOUND_PATTERN.fullmatch(agent_error["desc"])):
+                raise GuestExecPIDNotFound(agent_error["desc"])
             raise ValueError("guest-agent {} failed: {}".format(command, response["error"]))
         if not isinstance(response, dict) or "return" not in response:
             raise ValueError("invalid guest-agent response for {}".format(command))
@@ -360,6 +387,12 @@ class LibVirtAutoReclaim:
                                       "standby_cache=%s KiB pages/sec=%s pagefile=%s KiB",
                                       name, values[2] // 1024, (values[6] + values[7]) // 1024,
                                       (values[8] + values[9]) // 1024, values[3], values[4] * SZ_1MiB)
+                except GuestExecPIDNotFound as error:
+                    state.pop("pid")
+                    state.pop("sample", None)
+                    logging.log(error_level,
+                                "%s Windows guest-exec PID %s is no longer registered; "
+                                "clearing cached process and sample: %s", name, pid, error)
                 except (ImportError, libvirt.libvirtError, KeyError, TypeError, ValueError) as error:
                     logging.log(error_level, "%s cannot read Windows guest-exec result: %s", name, error)
             if state.get("pid") is None and not (single_shot and "started_at" in state):
@@ -614,10 +647,7 @@ class LibVirtAutoReclaim:
         memory_weight = parameters.get("memory_weight", 100)
         stats_method = memstat.get("source", "unavailable")
         memory_method = "read-only" if name in self.read_only_vms else backend["type"]
-        stats_label = "agent" if stats_method == "guest-agent" else stats_method
-        backend_label = (
-            "balloon" if stats_label == memory_method == "balloon"
-            else f"{stats_label}/{memory_method}")
+        backend_label = format_backend_label(stats_method, memory_method)
         floor = psi = swap_used = "n/a"
         if memory_method != "read-only":
             bounds = self._memory_bounds(dom, memory_method, total_ram)
@@ -869,10 +899,10 @@ class LibVirtAutoReclaim:
                           name, pending_target, actual)
             return
         logging.debug(
-            "%s [%s/%s] actual=%s usable=%s used_ewma=%.1f reserve=%.1f error=%.1f "
+            "%s [%s] actual=%s usable=%s used_ewma=%.1f reserve=%.1f error=%.1f "
             "derivative=%.1f used_rate=%.1f swap_drop_rate=%.1f psi_some=%s psi_full=%s "
             "emergency=%s floor=%s target=%s KiB",
-            name, source or "unavailable", backend["type"], actual, usable, used_ewma, reserve, error,
+            name, format_backend_label(source, backend["type"]), actual, usable, used_ewma, reserve, error,
             derivative, used_rate, swap_rate, psi_some, psi_full, emergency, floor, target)
         if backend["type"] == "virtio-mem":
             requested = dom_virtio_mem(dom, target, actual, minimum_ram_kb=dynamic_floor)
@@ -932,7 +962,7 @@ class LibVirtAutoReclaim:
                 name = dom.name()
                 if name not in self.monitored_vms or name in self.read_only_vms:
                     continue
-                period = self.stats_periods.get(name)
+                period = self.__effective_stats_period(name)
                 if period is None:
                     logging.warning("%s has no stats period, skipping", name)
                     continue
@@ -980,6 +1010,7 @@ class LibVirtAutoReclaim:
                 self.process_domainID(dom, pressure, memstat)
             except libvirt.libvirtError as error:
                 logging.warning("Domain stopped or unavailable, skipping: %s", error)
+        self.__update_poll_interval()
 
     def dom_print_names(self):
         domains = self.conn.listAllDomains()
@@ -992,8 +1023,21 @@ class LibVirtAutoReclaim:
             self.__refresh_domain(dom)
         self.__update_poll_interval()
 
+    def __effective_stats_period(self, name):
+        period = self.stats_periods.get(name)
+        if (period is None or self.vm_backends.get(name, {}).get("os") != "windows"
+                or name in self.pending_targets):
+            return period
+        sample = self.windows_agent_state.get(name, {}).get("sample")
+        interval = self.__vm_config_for_name(name).get("windows_agent_interval", 10)
+        if (sample is not None and sample.get("source") == "guest-agent"
+                and 0 <= monotonic() - sample["sampled_at"] <= max(30, interval * 3)):
+            return max(period, interval)
+        return period
+
     def __update_poll_interval(self):
-        interval = math.gcd(*self.stats_periods.values()) if self.stats_periods else 5
+        interval = (math.gcd(*(self.__effective_stats_period(name) for name in self.stats_periods))
+                    if self.stats_periods else 5)
         active = bool(self.stats_periods)
         timer_changed = interval != self.poll_interval or active != self.polling_active
         if active != self.polling_active:

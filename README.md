@@ -111,7 +111,11 @@ PowerShell, CIM and the QGA `guest-exec` commands must be enabled in the guest.
 If starting the command fails or its PID is uncertain, the daemon logs a
 warning and uses balloon statistics until the VM restarts; it does not risk
 launching another process whose PID may have been lost. If checking a known PID
-fails, the daemon keeps tracking it and retries the status check. Failed or
+times out or the agent disconnects, the daemon keeps tracking it and retries
+the status check. If QGA explicitly reports that the PID is no longer registered
+(`PID ... does not exist`), the daemon discards the PID and cached sample, then
+starts a new collection instead of retrying the lost PID indefinitely.
+Other command failures do not invalidate the PID. Failed or
 incomplete samples use fresh balloon statistics when available. For Windows,
 `status` launches one PowerShell sample per VM and waits for completion, checking
 the PID every 100 ms rather than using the daemon's sampling interval. The wait
@@ -157,8 +161,8 @@ virtio-mem guests.
 
 The daemon uses `libvirt-python` with one persistent connection to
 `qemu:///system`. The event-loop timer interval is the greatest common divisor
-of the stats periods of active monitored VMs. Each VM is sampled on the first
-cycle and thereafter only when its own stats period has elapsed since its last
+of the effective sampling periods of active monitored VMs. Each VM is sampled on the first
+cycle and thereafter only when its own effective period has elapsed since its last
 poll attempt. Inactive VMs do not affect the interval, and stats periods on a
 `<memballoon model='none'>` device are ignored. Discovery, definition changes,
 and removal of VMs recalculate the interval and update the running timer without
@@ -170,6 +174,14 @@ and becomes eligible for monitoring, checking configuration mtime before
 deciding whether to reload the file. Stopping the last such VM disables
 the timer again; the event loop remains active throughout. Five-minute
 configuration checks run only while VM polling is active.
+For Windows with a valid Guest Agent memory sample, the effective period is
+`max(stats_period, windows_agent_interval)`, avoiding repeated reads of the same
+cached sample. OS identification alone does not slow polling: before the first
+valid sample, or after it expires, the original stats period is used for balloon
+fallback. An outstanding memory target also keeps the original period so
+hypervisor allocation can be checked more frequently. Linux periods are unchanged.
+The global GCD is recalculated after each control cycle, including transitions
+between agent and balloon sampling or changes in pending memory targets.
 For large fleets using the agent, prefer a 3- to 5-second stats period to limit
 polling overhead. Each VM is controlled only when its statistics have updated. Guest Agent
 samples use monotonic collection time, so two samples in the same wall-clock
@@ -309,9 +321,11 @@ errors remain visible on standard error. The `start` command logs daemon events
 and memory adjustments to standard error; the `status` table uses standard output.
 Informational messages have no level prefix; other log levels retain their
 prefixes (`DEBUG`, `WARNING`, `ERROR`).
-Controller debug messages show `[source/method]`, for example
-`[guest-agent/balloon]` or `[balloon/virtio-mem]`, to distinguish the metrics
-source from the memory adjustment mechanism.
+Controller debug messages use the same source/method labels as `Backend`, for
+example `[agent/balloon]` or `[balloon/virtio-mem]`, to distinguish the metrics
+source from the memory adjustment mechanism. `guest-agent` is displayed as
+`agent`; identical source/method labels are collapsed, such as
+`[balloon/balloon]` to `[balloon]`.
 
 - `Floor`: effective reclaim floor in MiB, including the reserve, fixed
   virtio-mem base RAM, and guest anonymous pages and active file cache when

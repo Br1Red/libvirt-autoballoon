@@ -166,6 +166,9 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.controller.windows_agent_state = {}
         self.controller.windows_exec_enabled = True
         self.controller.poll_interval = 2
+        self.controller.polling_active = True
+        self.controller.poll_due = False
+        self.controller.timer_id = None
         self.controller.memory_targets = {}
         self.controller.pending_targets = {}
         self.controller.manual_increase_until = {}
@@ -215,6 +218,8 @@ class AdaptiveControllerTests(unittest.TestCase):
 
         for backend, read_only, stats_source, expected_backend in (
                 ("balloon", False, "balloon", "balloon"),
+                ("balloon", False, "guest-agent", "agent/balloon"),
+                ("agent", False, "guest-agent", "agent"),
                 ("virtio-mem", False, "guest-agent", "agent/virtio-mem"),
                 ("balloon", True, "guest-agent", "agent/read-only"),
                 ("balloon", True, "unavailable", "unavailable/read-only")):
@@ -543,6 +548,82 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertEqual(agent.call_count, 2)
         self.assertTrue(any("PowerShell failed" in message for message in logs.output))
 
+    def test_windows_agent_recovers_when_qga_forgets_exec_pid(self):
+        for message, raw_error in (
+                ("comando guest agent fallito: PID lld does not exist", False),
+                ("PID 42 does not exist", False),
+                ("PID ld does not exist", True)):
+            with self.subTest(message=message, raw_error=raw_error):
+                self.now = 100
+                self.controller.vm_backends["guest-a"] = {
+                    "type": "balloon", "has_guest_agent": True, "os": "windows"}
+                self.controller.windows_agent_state["guest-a"] = {
+                    "pid": 42, "next_check": 100, "started_at": 90, "started_wall": 90,
+                    "sample": {"actual": 1048576, "usable": 1, "sampled_at": 90,
+                               "last_update": 90, "source": "guest-agent"}}
+                error = autoreclaim.libvirt.libvirtError(message)
+                error.get_error_code = lambda: 113
+                commands = []
+                launched = iter((43, 44))
+
+                def agent(_dom, raw, _timeout, _flags):
+                    command = json.loads(raw)
+                    commands.append(command)
+                    if command["execute"] == "guest-exec":
+                        return json.dumps({"return": {"pid": next(launched)}})
+                    if command["arguments"]["pid"] == 42:
+                        if raw_error:
+                            return json.dumps({"error": {"class": "GenericError", "desc": message}})
+                        raise error
+                    return json.dumps({"return": {
+                        "exited": True, "exitcode": 0, "out-data": base64.b64encode(
+                            b"1048576|536870912|0|0|0|0|0|0|0|0").decode()}})
+
+                with patch.object(autoreclaim.libvirt, "VIR_ERR_AGENT_COMMAND_FAILED", 113,
+                                  create=True), \
+                        patch.dict(sys.modules, {"libvirt_qemu": types.SimpleNamespace(
+                            qemuAgentCommand=agent)}):
+                    with self.assertLogs(level="WARNING"):
+                        first = self.controller._get_windows_guest_meminfo(self.domain)
+                    self.assertIsNone(first)
+                    state = self.controller.windows_agent_state["guest-a"]
+                    self.assertEqual(state["pid"], 43)
+                    self.assertNotIn("sample", state)
+                    self.now = 110
+                    sample = self.controller._get_windows_guest_meminfo(self.domain)
+                self.assertEqual(sample["usable"], 524288)
+                self.assertEqual(sample["sampled_at"], 100)
+                self.assertEqual(state["pid"], 44)
+                self.assertEqual([command["execute"] for command in commands],
+                                 ["guest-exec-status", "guest-exec", "guest-exec-status", "guest-exec"])
+                self.assertEqual([command["arguments"]["pid"] for command in commands
+                                  if command["execute"] == "guest-exec-status"], [42, 43])
+
+    def test_windows_agent_keeps_pid_and_cached_sample_on_transient_status_errors(self):
+        for code, message in (
+                (86, "Guest agent not connected"),
+                (112, "Guest agent command timed out"),
+                (113, "Permission denied"),
+                (86, "PID 42 does not exist")):
+            with self.subTest(code=code, message=message):
+                self.now = 100
+                cached = {"actual": 1048576, "usable": 524288, "source": "guest-agent",
+                          "sampled_at": 90, "last_update": 90}
+                self.controller.windows_agent_state["guest-a"] = {
+                    "pid": 42, "next_check": 100, "started_at": 90,
+                    "started_wall": 90, "sample": cached}
+                error = autoreclaim.libvirt.libvirtError(message)
+                error.get_error_code = lambda: code
+                agent = Mock(side_effect=error)
+                with patch.object(autoreclaim.libvirt, "VIR_ERR_AGENT_COMMAND_FAILED", 113,
+                                  create=True), \
+                        patch.dict(sys.modules, {"libvirt_qemu": types.SimpleNamespace(
+                            qemuAgentCommand=agent)}), self.assertLogs(level="WARNING"):
+                    self.assertIs(self.controller._get_windows_guest_meminfo(self.domain), cached)
+                self.assertEqual(self.controller.windows_agent_state["guest-a"]["pid"], 42)
+                self.assertEqual(agent.call_count, 1)
+                self.assertEqual(json.loads(agent.call_args.args[1])["execute"], "guest-exec-status")
+
     def test_windows_agent_rejects_malformed_or_failed_results(self):
         for result in (
                 {"exited": True, "exitcode": 1},
@@ -615,8 +696,12 @@ class AdaptiveControllerTests(unittest.TestCase):
                         self.assertNotIn("guest-a", self.controller.control_samples)
 
     def test_controller_debug_distinguishes_statistics_source_and_memory_backend(self):
-        for source in ("guest-agent", "balloon"):
-            with self.subTest(source=source):
+        for source, backend, expected in (
+                ("guest-agent", "balloon", "agent/balloon"),
+                ("balloon", "balloon", "balloon"),
+                ("guest-agent", "agent", "agent")):
+            with self.subTest(source=source, backend=backend):
+                self.controller.vm_backends["guest-a"] = {"type": backend}
                 self.controller.control_samples.clear()
                 self.controller.memory_targets.clear()
                 self.controller.pending_targets.clear()
@@ -626,7 +711,7 @@ class AdaptiveControllerTests(unittest.TestCase):
                                      return_value=(0, 0)):
                     self.controller.process_domainID(self.domain, 0, stats)
                 self.assertTrue(any(
-                    f"guest-a [{source}/balloon] actual=" in message for message in logs.output))
+                    f"guest-a [{expected}] actual=" in message for message in logs.output))
 
     def test_windows_pages_per_sec_only_vetoes_reclaim_without_forcing_growth(self):
         self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
@@ -1769,6 +1854,94 @@ class AdaptiveControllerTests(unittest.TestCase):
             (100, "guest-slow"), (105, "guest-slow"), (110, "guest-slow"),
         ])
         self.assertEqual(pressure.call_count, 7)
+
+    def test_windows_agent_slows_its_polling_without_slowing_linux(self):
+        linux = Domain("guest-linux")
+        self.controller.monitored_vms.add(linux.name())
+        self.controller.stats_periods[linux.name()] = 4
+        self.controller.config["vms"][0]["windows_agent_interval"] = 15
+        self.controller.vm_backends["guest-a"] = {
+            "type": "balloon", "os": "windows", "has_guest_agent": True}
+        self.controller.conn = Mock()
+        self.controller.conn.listDomainsID.return_value = [1, 2]
+        self.controller.conn.lookupByID.side_effect = lambda domain_id: self.domain if domain_id == 1 else linux
+        samples = []
+
+        def guest_sample(dom):
+            sample = {"actual": dom.memory, "usable": dom.usable,
+                      "source": "guest-agent", "sampled_at": self.now, "last_update": self.now}
+            self.controller.windows_agent_state[dom.name()] = {"sample": sample}
+            return sample
+
+        original_sample = self.controller._get_domain_memstats
+
+        def domain_sample(dom, **kwargs):
+            samples.append((self.now, dom.name()))
+            return original_sample(dom, **kwargs)
+
+        with patch.object(self.controller, "_get_guest_memstats", side_effect=guest_sample), \
+                patch.object(self.controller, "_get_domain_memstats", side_effect=domain_sample), \
+                patch.object(self.controller, "host_memory_pressure", return_value=0), \
+                patch.object(self.controller, "process_domainID"):
+            for now in range(100, 131):
+                self.now = now
+                self.controller.process_domains()
+        self.assertEqual([now for now, name in samples if name == "guest-a"], [100, 115, 130])
+        self.assertEqual([now for now, name in samples if name == linux.name()],
+                         [100, 104, 108, 112, 116, 120, 124, 128])
+        self.assertEqual(self.controller.stats_periods["guest-a"], 2)
+        self.assertEqual(self.controller.poll_interval, 1)
+
+    def test_expired_windows_agent_sample_restores_balloon_polling(self):
+        self.controller.vm_backends["guest-a"] = {
+            "type": "balloon", "os": "windows", "has_guest_agent": True}
+        self.controller.windows_agent_state["guest-a"] = {
+            "next_check": 200, "sample": {
+                "actual": self.domain.memory, "usable": self.domain.usable,
+                "source": "guest-agent", "sampled_at": 100, "last_update": 100}}
+        self.controller.conn = Mock()
+        self.controller.conn.listDomainsID.return_value = [1]
+        self.controller.conn.lookupByID.return_value = self.domain
+        self.controller.timer_id = 7
+        with patch.object(autoreclaim.libvirt, "virEventUpdateTimeout", create=True) as timer, \
+                patch.object(self.controller, "host_memory_pressure", return_value=0), \
+                patch.object(self.controller, "process_domainID") as process:
+            for now in (100, 110, 120, 130, 140, 142):
+                self.now = now
+                self.domain.updated = now
+                self.controller.process_domains()
+                self.assertEqual(self.controller.poll_interval, 10 if now <= 130 else 2)
+        self.assertEqual([call.args[2]["source"] for call in process.call_args_list],
+                         ["guest-agent"] * 4 + ["balloon"] * 2)
+        self.assertEqual([call.args for call in timer.call_args_list], [(7, 10000), (7, 2000)])
+
+    def test_pending_windows_memory_target_keeps_original_poll_period(self):
+        self.controller.config["default"]["windows_agent_interval"] = 20
+        self.controller.vm_backends["guest-a"] = {"type": "balloon", "os": "windows"}
+        self.controller.windows_agent_state["guest-a"] = {
+            "sample": {**self.domain.memoryStats(), "source": "guest-agent", "sampled_at": 100}}
+        self.controller.conn = Mock()
+        self.controller.conn.listDomainsID.return_value = [1]
+        self.controller.conn.lookupByID.return_value = self.domain
+        with patch.object(self.controller, "_get_domain_memstats",
+                          return_value=self.domain.memoryStats()) as sample, \
+                patch.object(self.controller, "host_memory_pressure", return_value=0), \
+                patch.object(self.controller, "process_domainID"):
+            self.controller.process_domains()
+            self.assertEqual(self.controller.poll_interval, 20)
+            self.controller.pending_targets["guest-a"] = (2097152, 100)
+            self.now = 102
+            self.controller.process_domains()
+            self.assertEqual(sample.call_count, 2)
+            self.assertEqual(self.controller.poll_interval, 2)
+            self.controller.pending_targets.clear()
+            self.now = 104
+            self.controller.process_domains()
+            self.assertEqual(sample.call_count, 2)
+            self.assertEqual(self.controller.poll_interval, 20)
+            self.now = 122
+            self.controller.process_domains()
+            self.assertEqual(sample.call_count, 3)
 
     def test_failed_sample_waits_for_next_period_before_retrying(self):
         self.controller.conn = Mock()
