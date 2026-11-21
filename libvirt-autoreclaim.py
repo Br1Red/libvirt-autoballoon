@@ -25,6 +25,7 @@ GUEST_SWAP_EMERGENCY_KIB_PER_SEC = 10 * SZ_1MiB
 GUEST_SWAP_VETO_KIB_PER_SEC = 64
 GUEST_SWAP_VETO_MIN_DROP_KIB = 256
 GUEST_OS_RETRY_INTERVAL = 60
+WINDOWS_STATUS_TIMEOUT = 5
 WINDOWS_MEMORY_COMMAND = (
     "$ErrorActionPreference='Stop'; "
     "$os=Get-CimInstance Win32_OperatingSystem; "
@@ -110,6 +111,7 @@ class LibVirtAutoReclaim:
     conn = None
     config = None
     config_check_interval = 300
+    agent_error_level = logging.WARNING
 
     def __init__(self, qemu_addr='qemu:///system', configfile='/etc/libvirt/autoreclaim.json'):
         self.configfile = configfile
@@ -125,6 +127,8 @@ class LibVirtAutoReclaim:
         self.stats_periods = {}
         self.last_poll_times = {}
         self.timer_id = None
+        self.polling_active = False
+        self.poll_due = False
         self.memory_targets = {}
         self.pending_targets = {}
         self.manual_increase_until = {}
@@ -284,8 +288,9 @@ class LibVirtAutoReclaim:
                 logging.debug("%s identified guest OS: %s (backend OS: %s)",
                               name, info["id"], self.guest_os[name])
             except (ImportError, libvirt.libvirtError, ValueError) as error:
-                logging.warning("%s cannot identify guest OS; using balloon statistics and retrying "
-                                "in %s seconds: %s", name, GUEST_OS_RETRY_INTERVAL, error)
+                logging.log(self.agent_error_level,
+                            "%s cannot identify guest OS; using balloon statistics and retrying "
+                            "in %s seconds: %s", name, GUEST_OS_RETRY_INTERVAL, error)
                 self.guest_os[name] = None
                 self.guest_os_retry_at[name] = now + GUEST_OS_RETRY_INTERVAL
         return self.guest_os[name]
@@ -293,7 +298,29 @@ class LibVirtAutoReclaim:
     def _get_windows_guest_meminfo(self, dom):
         if not self.windows_exec_enabled:
             return None
+        return self._poll_windows_guest_meminfo(dom)
+
+    def _get_windows_status_meminfo(self, dom):
+        deadline = monotonic() + WINDOWS_STATUS_TIMEOUT
         name = dom.name()
+        while True:
+            state = self.windows_agent_state.setdefault(name, {"next_check": 0})
+            state["next_check"] = 0
+            sample = self._poll_windows_guest_meminfo(dom, single_shot=True)
+            if sample is not None:
+                return sample
+            if state.get("pid") is None or state.get("blocked"):
+                return None
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                logging.debug("%s Windows status memory sample timed out after %s seconds",
+                              name, WINDOWS_STATUS_TIMEOUT)
+                return None
+            sleep(min(0.1, remaining))
+
+    def _poll_windows_guest_meminfo(self, dom, *, single_shot=False):
+        name = dom.name()
+        error_level = logging.DEBUG if single_shot else self.agent_error_level
         interval = self.__vm_config_for_name(name).get("windows_agent_interval", 10)
         windows_sample_max_age = max(30, interval * 3)
         state = self.windows_agent_state.setdefault(name, {"next_check": 0})
@@ -333,9 +360,9 @@ class LibVirtAutoReclaim:
                                       "standby_cache=%s KiB pages/sec=%s pagefile=%s KiB",
                                       name, values[2] // 1024, (values[6] + values[7]) // 1024,
                                       (values[8] + values[9]) // 1024, values[3], values[4] * SZ_1MiB)
-                except (ImportError, libvirt.libvirtError, KeyError, TypeError, ValueError, UnicodeError) as error:
-                    logging.warning("%s cannot read Windows guest-exec result: %s", name, error)
-            if state.get("pid") is None:
+                except (ImportError, libvirt.libvirtError, KeyError, TypeError, ValueError) as error:
+                    logging.log(error_level, "%s cannot read Windows guest-exec result: %s", name, error)
+            if state.get("pid") is None and not (single_shot and "started_at" in state):
                 try:
                     result = self.__guest_agent_command(dom, "guest-exec", {
                         "path": "powershell.exe",
@@ -348,8 +375,8 @@ class LibVirtAutoReclaim:
                     state.update(pid=result["pid"], started_at=now, started_wall=int(time()))
                 except (ImportError, libvirt.libvirtError, ValueError) as error:
                     state["blocked"] = True
-                    logging.warning("%s cannot start Windows guest-exec; using balloon statistics "
-                                    "until restart: %s", name, error)
+                    logging.log(error_level, "%s cannot start Windows guest-exec; using balloon statistics "
+                                "until restart: %s", name, error)
         sample = state.get("sample")
         if sample is not None and 0 <= now - sample["sampled_at"] <= windows_sample_max_age:
             return sample
@@ -568,17 +595,23 @@ class LibVirtAutoReclaim:
                               ((guest_floor + SZ_4KiB - 1) // SZ_4KiB) * SZ_4KiB)
         return static_floor, max(static_floor, guest_floor)
 
-    def dom_status(self, dom):
-        memstat = self._get_domain_memstats(dom)
+    def dom_status(self, dom, *, memstat=None):
+        name = dom.name()
+        backend = self.vm_backends.get(name, {"type": "balloon"})
+        if memstat is None:
+            if backend.get("os") == "windows" and (
+                    backend.get("has_guest_agent") or name in self.guest_agents or name in self.read_only_vms):
+                guest_stats = self._get_windows_status_meminfo(dom)
+                memstat = self._get_domain_memstats(dom, guest_stats=guest_stats, query_guest=False)
+            else:
+                memstat = self._get_domain_memstats(dom)
         actual = memstat.get("actual", 0)
         usable = memstat.get("usable", 0)
         used = actual - usable
         total_ram = dom.info()[1]
         keep_usable = self.dom_keep_usable(dom, actual)
-        name = dom.name()
         parameters = self.__vm_config_for_name(name)
         memory_weight = parameters.get("memory_weight", 100)
-        backend = self.vm_backends.get(name, {"type": "balloon"})
         stats_method = memstat.get("source", "unavailable")
         memory_method = "read-only" if name in self.read_only_vms else backend["type"]
         stats_label = "agent" if stats_method == "guest-agent" else stats_method
@@ -623,9 +656,34 @@ class LibVirtAutoReclaim:
             "Domain", "Backend", "Total", "Actual",
             "Used", "Usable", "Keep_Usable", "Weight", "Floor", "PSI", "Swap_Used",
         )]
+        domains = []
         for domainID in domainIDs:
             dom = self.conn.lookupByID(domainID)
             if dom.name() in self.monitored_vms:
+                domains.append(dom)
+        futures = {}
+        windows_samples = {}
+        try:
+            for dom in domains:
+                name = dom.name()
+                backend = self.vm_backends.get(name, {})
+                if name not in futures and backend.get("os") == "windows" and (
+                        backend.get("has_guest_agent") or name in self.guest_agents
+                        or name in self.read_only_vms):
+                    futures[name] = self.agent_executor.submit(self._get_windows_status_meminfo, dom)
+            for name, future in futures.items():
+                windows_samples[name] = future.result()
+        finally:
+            for future in futures.values():
+                future.cancel()
+            wait(futures.values())
+        for dom in domains:
+            name = dom.name()
+            if name in windows_samples:
+                memstat = self._get_domain_memstats(
+                    dom, guest_stats=windows_samples[name], query_guest=False)
+                rows.append(self.dom_status(dom, memstat=memstat))
+            else:
                 rows.append(self.dom_status(dom))
         widths = [max(len(value) for value in column) for column in zip(*rows)]
         for row in rows:
@@ -936,11 +994,18 @@ class LibVirtAutoReclaim:
 
     def __update_poll_interval(self):
         interval = math.gcd(*self.stats_periods.values()) if self.stats_periods else 5
+        active = bool(self.stats_periods)
+        timer_changed = interval != self.poll_interval or active != self.polling_active
+        if active != self.polling_active:
+            self.polling_active = active
+            self.poll_due = active
+            logging.info("VM polling %s", "resumed" if active else "suspended")
         if interval != self.poll_interval:
             self.poll_interval = interval
             logging.info("Polling interval changed to %s seconds", interval)
-            if self.timer_id is not None:
-                libvirt.virEventUpdateTimeout(self.timer_id, interval * 1000)
+        if timer_changed and self.timer_id is not None:
+            libvirt.virEventUpdateTimeout(
+                self.timer_id, interval * 1000 if active else -1)
 
     def __forget_domain(self, name):
         if name in self.monitored_vms and name not in self.read_only_vms:
@@ -1113,7 +1178,9 @@ class LibVirtAutoReclaim:
                 self.pending_targets.pop(name, None)
 
     def __poll_timeout(self, timer, opaque):
-        self.poll_due = True
+        self.poll_due = self.polling_active
+        if not self.polling_active:
+            return
         now = monotonic()
         if now - getattr(self, "config_check_at", 0) >= self.config_check_interval:
             self.config_check_at = now
@@ -1181,10 +1248,12 @@ class LibVirtAutoReclaim:
             # Lifecycle events may have been missed while disconnected.
             self.last_poll_times.clear()
             self.dom_print_names()
-            self.poll_due = True
+            self.poll_due = self.polling_active
             if self.timer_id is None:
                 self.timer_id = libvirt.virEventAddTimeout(
-                    self.poll_interval * 1000, self.__poll_timeout, None)
+                    self.poll_interval * 1000 if self.polling_active else -1,
+                    self.__poll_timeout, None)
+            self.reconnect_delay = 1
             while True:
                 if self.poll_due:
                     self.poll_due = False
@@ -1320,10 +1389,12 @@ def dom_virtio_mem(dom, target_total_kb, actual_total_kb, *, minimum_ram_kb=0):
 def handle_sigterm(signum, _frame):
     raise SystemExit(128 + signum)
 
-def report_libvirt_error(_context, error):
+def report_libvirt_error(context, error):
     code, _, message, level = error[:4]
     if (code == libvirt.VIR_ERR_AGENT_UNRESPONSIVE
-            or code == getattr(libvirt, "VIR_ERR_AGENT_COMMAND_TIMEOUT", None)):
+            or code == getattr(libvirt, "VIR_ERR_AGENT_COMMAND_TIMEOUT", None)
+            or (context == "status"
+                and code == getattr(libvirt, "VIR_ERR_AGENT_COMMAND_FAILED", None))):
         # The guest-agent reader already reports the exception at debug level.
         return
     log = logging.warning if level == libvirt.VIR_ERR_WARNING else logging.error
@@ -1345,12 +1416,13 @@ def libvirt_autoreclaim(argv):
         handlers=[handler])
     previous_sigterm = signal.signal(signal.SIGTERM, handle_sigterm)
     try:
-        libvirt.registerErrorHandler(report_libvirt_error, None)
+        libvirt.registerErrorHandler(report_libvirt_error, args.action)
         lv_ctrl = LibVirtAutoReclaim(configfile=args.config)
         try:
             if args.action == "start":
                 lv_ctrl.daemon()
             elif args.action == "status":
+                lv_ctrl.agent_error_level = logging.DEBUG
                 lv_ctrl.status()
         finally:
             lv_ctrl.agent_executor.shutdown(wait=True)

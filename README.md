@@ -44,6 +44,30 @@ blocks reclaim without forcing growth. Missing counters, counter resets and
 changes of statistics source do not trigger this veto. Major faults can also
 reflect file-backed reads, so this is a conservative paging heuristic.
 
+**Limitations when only balloon statistics are available**
+
+- A working guest balloon driver must report `actual`, `usable` and
+  `last_update`. Allocation alone is not enough to control memory. Invalid,
+  unchanged or more than 15-second-old samples are skipped; statistics may be
+  incomplete during guest boot or driver startup.
+- `Used` is calculated as `actual - usable`, not measured as process working
+  sets. The meaning of `usable` depends on the guest driver and OS, so the
+  daemon cannot precisely separate active memory from recoverable file cache
+  or Windows standby lists.
+- Without Linux `AnonPages` and `Active(file)`, the reclaim floor falls back
+  to `(max(0, actual - usable) + keep_free_kb) / max(0.1, 1 - keep_free_ratio)`,
+  subject to the static floor, maximum RAM and alignment. This conservative
+  estimate can protect recoverable cache and stop reclaim above the reserve.
+- Guest PSI, Windows Pages/sec and pagefile allocation/usage are unavailable.
+  `status` therefore shows `n/a` for `PSI` and `Swap_Used`. Optional balloon
+  `swap_out` and `major_fault` deltas can veto reclaim, but do not provide
+  current swap occupancy or trigger paging-based emergency growth.
+- If those optional counters are missing, the daemon has no guest paging
+  veto from balloon telemetry. Low usable memory and rapid consumption still
+  trigger emergency growth, and host-pressure, reserve, floor, rate and
+  grace-period protections remain active, but they cannot guarantee avoidance
+  of guest paging or OOM. A usable Guest Agent provides more detailed telemetry.
+
 For Windows (`id: mswindows`), the daemon does not read Linux `/proc` files.
 It asynchronously runs PowerShell via QGA `guest-exec` and polls
 `guest-exec-status` no more often than every `windows_agent_interval` seconds
@@ -88,9 +112,23 @@ If starting the command fails or its PID is uncertain, the daemon logs a
 warning and uses balloon statistics until the VM restarts; it does not risk
 launching another process whose PID may have been lost. If checking a known PID
 fails, the daemon keeps tracking it and retries the status check. Failed or
-incomplete samples use fresh balloon statistics when available. `status` does not start
-a Windows guest process and therefore uses balloon statistics, or reports
-`unavailable` for a read-only guest.
+incomplete samples use fresh balloon statistics when available. For Windows,
+`status` launches one PowerShell sample per VM and waits for completion, checking
+the PID every 100 ms rather than using the daemon's sampling interval. The wait
+budget is five seconds per VM; an in-flight agent RPC may add its one-second
+timeout. A valid sample shows `agent/balloon` or `agent/virtio-mem` and pagefile
+usage in `Swap_Used`. A failed or timed-out sample falls back to fresh balloon
+statistics, or reports `unavailable/read-only` when no other metrics are available.
+These failures are visible only with `--debug` for `status`.
+No second PowerShell process is launched after completion or failure. A timeout
+does not kill the guest process; its PID is retained for the lifetime of that
+CLI invocation, but is not shared with the daemon or subsequent invocations.
+Windows samples for `status` run concurrently in the existing pool, up to
+`general.agent_workers` at a time (4 by default). All agent tasks finish before
+hypervisor statistics, XML inspection and table rows are processed serially.
+Row order is unchanged. Up to the worker limit, slow Windows guests wait in
+parallel rather than adding their timeout budgets together; larger fleets
+are processed in batches.
 When no valid balloon stats
 period is configured, the daemon polls at the default 5-second interval.
 Without a usable guest agent, a missing, non-numeric, zero, or greater-than-5
@@ -124,7 +162,14 @@ cycle and thereafter only when its own stats period has elapsed since its last
 poll attempt. Inactive VMs do not affect the interval, and stats periods on a
 `<memballoon model='none'>` device are ignored. Discovery, definition changes,
 and removal of VMs recalculate the interval and update the running timer without
-restarting the daemon. With no active monitored VMs, the interval is 5 seconds.
+restarting the daemon. With no active monitored VMs requiring memory polling,
+VM polling and periodic configuration checks are suspended: the timer is
+disabled, without sampling VMs, host memory pressure or checking file mtime.
+Libvirt/QEMU lifecycle events immediately resume polling when a VM starts
+and becomes eligible for monitoring, checking configuration mtime before
+deciding whether to reload the file. Stopping the last such VM disables
+the timer again; the event loop remains active throughout. Five-minute
+configuration checks run only while VM polling is active.
 For large fleets using the agent, prefer a 3- to 5-second stats period to limit
 polling overhead. Each VM is controlled only when its statistics have updated. Guest Agent
 samples use monotonic collection time, so two samples in the same wall-clock
@@ -254,9 +299,11 @@ statistics source (`agent`, `balloon`, or `unavailable`) and the memory method
 `agent/virtio-mem` uses QEMU Guest Agent statistics and adjusts memory via
 virtio-mem. `balloon/balloon` is displayed simply as `balloon`. Column
 widths adapt to domain names and values. Connection, configuration-loading,
-and monitoring messages are hidden by default. An unresponsive or disconnected
-QEMU Guest Agent reads are reported only with `--debug`; OS identification
-and Windows guest-exec failures are logged as warnings. If no other statistics are
+and monitoring messages are hidden by default. Guest Agent unavailability,
+timeouts, command failures (including missing guest files) and OS identification
+failures are reported only with `--debug` for `status`. The `start` command
+retains its warnings for OS identification and Windows guest-exec failures.
+If no other statistics are
 available, `Backend` uses `unavailable` as the source. Other warnings and
 errors remain visible on standard error. The `start` command logs daemon events
 and memory adjustments to standard error; the `status` table uses standard output.
