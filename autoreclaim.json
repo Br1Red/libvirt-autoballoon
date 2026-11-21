@@ -1,7 +1,8 @@
 {
 	"general": {
 		"psi_threshold": 5.0,
-		"host_min_free_ratio": 0.2
+		"host_min_free_ratio": 0.2,
+		"agent_workers": 4
 	},
 	"default": {
 		"auto_reclaim": true,
@@ -13,6 +14,9 @@
 		"reclaim_ratio": 0.015,
 		"pd_kp": 0.5,
 		"pd_kd": 1.0,
+		"windows_agent_interval": 10,
+		"windows_paging_veto_pages_per_sec": 1000,
+		"balloon_major_fault_veto_per_sec": 50,
 		"manual_increase_grace_seconds": 600
 	},
 	"vms": [

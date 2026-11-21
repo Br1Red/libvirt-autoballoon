@@ -20,16 +20,77 @@ virtio-mem device. A balloon device normally defines a stats period from 1 to
 </devices>
 ```
 
-For memory control and `status`, the daemon queries QEMU Guest Agent first.
-It reads `MemTotal`, `MemAvailable`, `AnonPages`,
+For memory control and `status`, the daemon identifies the guest OS once per
+VM start with QEMU Guest Agent `guest-get-osinfo`. With `--debug`, it logs the
+guest name, detected OS ID and backend OS classification. If identification fails, it
+logs a warning, uses balloon statistics and retries identification every
+60 seconds until the agent responds, allowing for delayed startup in the guest.
+Successful identification remains cached until the VM restarts. On other
+identified guests, it reads `MemTotal`, `MemAvailable`, `AnonPages`,
 `Active(file)`, `Inactive(file)`, `SwapTotal`, and `SwapFree` in a single
 `guest-file-read` of the guest's `/proc/meminfo` per poll when the VM has a
 QEMU Guest Agent channel. The XML must define the
 `org.qemu.guest_agent.0` Unix channel and the agent must be running and
 reachable. With a valid guest sample, the daemon uses `MemTotal` for balloon
 guests without querying balloon statistics. If the agent times out or cannot
-read meminfo (for example, on Windows), it falls back to fresh balloon
-statistics when available. Each agent command has a one-second timeout.
+read meminfo, it falls back to fresh balloon statistics when available. Each
+agent command has a one-second timeout.
+
+Balloon samples retain the optional cumulative `swap_in`, `swap_out` and
+`major_fault` counters reported by libvirt. Between successive balloon samples,
+any increase in `swap_out` or a `major_fault` rate above
+`balloon_major_fault_veto_per_sec` (50 faults/second by default)
+blocks reclaim without forcing growth. Missing counters, counter resets and
+changes of statistics source do not trigger this veto. Major faults can also
+reflect file-backed reads, so this is a conservative paging heuristic.
+
+For Windows (`id: mswindows`), the daemon does not read Linux `/proc` files.
+It asynchronously runs PowerShell via QGA `guest-exec` and polls
+`guest-exec-status` no more often than every `windows_agent_interval` seconds
+(10 by default), with at most one
+process in flight per VM to limit PowerShell/CIM overhead. Windows agent samples
+remain valid for `max(30, windows_agent_interval * 3)` seconds from process
+launch (30 by default); Linux and balloon samples
+retain their 15-second freshness limit. It reads physical total and available memory,
+system cache, pages/sec and pagefile allocation and usage using CIM. The
+controller uses hypervisor allocation (`memoryStats().actual` for balloon,
+fixed RAM plus plugged devices for virtio-mem) rather than Windows
+`TotalVisibleMemorySize` for `Actual` and target completion. Available memory
+is `(FreeAndZeroPageListBytes + StandbyCacheNormalPriorityBytes +
+StandbyCacheReserveBytes) / 1024`, bounded by Windows-visible memory and,
+for adjustable guests, hypervisor allocation. `FreePhysicalMemory` is not used
+as a free-list counter to avoid potentially counting standby twice.
+A switch between balloon and agent statistics resets
+the controller sample without classifying the change as an external RAM increase.
+The pagefile counters populate `swap_total` and `swap_free`, enabling the existing
+growth-rate veto and emergency protections and the `Swap_Used` status column
+when a Windows agent sample is available. Pages/sec above
+`windows_paging_veto_pages_per_sec` (1000 by default) blocks reclaim
+but never forces growth. Emergency growth relies on low available RAM, rapid
+memory consumption or increasing pagefile usage. This is a Windows-specific heuristic,
+not a conversion to Linux PSI: hard faults can also read memory-mapped files.
+The Windows guest reclaim floor is `(max(0, actual - usable) + minimum reserve) /
+(1 - keep_free_ratio)`, bounded by the static floor and maximum RAM, with the
+denominator bounded below by 0.1. This conservatively protects memory not counted
+as available, including hardware-reserved RAM. It is an estimate, since the
+guest counters and hypervisor allocation are not sampled atomically.
+`SystemCacheResidentBytes` and `StandbyCacheCoreBytes` are collected as
+`protected_cache_kb` for diagnostics but are not added again to the floor.
+Protecting Core standby is a conservative policy; it does not mean those
+standby pages are inherently unreclaimable.
+`StandbyCacheNormalPriorityBytes` and `StandbyCacheReserveBytes` are collected
+as `standby_cache_kb` and included fully in `usable`, so they do not contribute
+to the memory protected by the floor.
+Total cache, protected cache, standby cache, pages/sec and pagefile usage
+are logged at debug level.
+PowerShell, CIM and the QGA `guest-exec` commands must be enabled in the guest.
+If starting the command fails or its PID is uncertain, the daemon logs a
+warning and uses balloon statistics until the VM restarts; it does not risk
+launching another process whose PID may have been lost. If checking a known PID
+fails, the daemon keeps tracking it and retries the status check. Failed or
+incomplete samples use fresh balloon statistics when available. `status` does not start
+a Windows guest process and therefore uses balloon statistics, or reports
+`unavailable` for a read-only guest.
 When no valid balloon stats
 period is configured, the daemon polls at the default 5-second interval.
 Without a usable guest agent, a missing, non-numeric, zero, or greater-than-5
@@ -57,19 +118,26 @@ describe the same guest memory allocation. Prefer disabling the balloon with
 virtio-mem guests.
 
 The daemon uses `libvirt-python` with one persistent connection to
-`qemu:///system`. The polling interval is the minimum XML stats period among
-active monitored VMs, using libvirt's event loop. Inactive VMs do not affect
-the interval, and stats periods on a `<memballoon model='none'>` device are
-ignored. Discovery, definition changes, and removal of VMs recalculate the
-interval and update the running timer without restarting the daemon. With no
-active monitored VMs, the interval is 5 seconds. For large fleets using the
-agent, prefer a 3- to 5-second interval to limit polling overhead.
-Each VM is controlled only when its own statistics have updated. Guest Agent
+`qemu:///system`. The event-loop timer interval is the greatest common divisor
+of the stats periods of active monitored VMs. Each VM is sampled on the first
+cycle and thereafter only when its own stats period has elapsed since its last
+poll attempt. Inactive VMs do not affect the interval, and stats periods on a
+`<memballoon model='none'>` device are ignored. Discovery, definition changes,
+and removal of VMs recalculate the interval and update the running timer without
+restarting the daemon. With no active monitored VMs, the interval is 5 seconds.
+For large fleets using the agent, prefer a 3- to 5-second stats period to limit
+polling overhead. Each VM is controlled only when its statistics have updated. Guest Agent
 samples use monotonic collection time, so two samples in the same wall-clock
 second are still distinct. Guest
 `/proc/pressure/memory` is read only after a successful Guest Agent meminfo
 read, when available memory is below twice the effective reserve or the PD
 controller computes a negative correction.
+
+Guest Agent memory reads use one persistent pool sized by `general.agent_workers`
+(four workers by default), with at most
+one task per VM per cycle. All agent tasks finish before XML, balloon statistics
+and memory adjustments are queried serially on the main thread. The pool is
+closed on daemon shutdown; connection cleanup waits for outstanding agent tasks.
 
 After an initial inventory, libvirt lifecycle events discover newly defined
 or started VMs and recheck their monitoring requirements without restarting
@@ -187,17 +255,22 @@ statistics source (`agent`, `balloon`, or `unavailable`) and the memory method
 virtio-mem. `balloon/balloon` is displayed simply as `balloon`. Column
 widths adapt to domain names and values. Connection, configuration-loading,
 and monitoring messages are hidden by default. An unresponsive or disconnected
-QEMU Guest Agent is reported only with `--debug`; if no other statistics are
+QEMU Guest Agent reads are reported only with `--debug`; OS identification
+and Windows guest-exec failures are logged as warnings. If no other statistics are
 available, `Backend` uses `unavailable` as the source. Other warnings and
-errors remain visible. The `start`
-command retains informational logs.
+errors remain visible on standard error. The `start` command logs daemon events
+and memory adjustments to standard error; the `status` table uses standard output.
 Informational messages have no level prefix; other log levels retain their
 prefixes (`DEBUG`, `WARNING`, `ERROR`).
+Controller debug messages show `[source/method]`, for example
+`[guest-agent/balloon]` or `[balloon/virtio-mem]`, to distinguish the metrics
+source from the memory adjustment mechanism.
 
 - `Floor`: effective reclaim floor in MiB, including the reserve, fixed
   virtio-mem base RAM, and guest anonymous pages and active file cache when
-  available. This is a reclaim limit, not a growth target; read-only VMs show
-  `n/a`.
+  available. Without both guest metrics, it uses `max(0, actual - usable)`
+  when actual and usable memory are available, including balloon samples.
+  This is a reclaim limit, not a growth target; read-only VMs show `n/a`.
 - `PSI`: guest memory `some avg10`, reported as a percentage. `status` reads
   it once per VM whose `Backend` starts with `agent/`; it shows `n/a` if
   unavailable. This does not change PSI polling in the daemon.
@@ -211,7 +284,8 @@ values. If `auto_reclaim` is omitted from both places, it defaults to `false`.
 {
   "general": {
     "psi_threshold": 5.0,
-    "host_min_free_ratio": 0.2
+    "host_min_free_ratio": 0.2,
+    "agent_workers": 4
   },
   "default": {
     "auto_reclaim": true,
@@ -223,6 +297,9 @@ values. If `auto_reclaim` is omitted from both places, it defaults to `false`.
     "reclaim_ratio": 0.015,
     "pd_kp": 0.5,
     "pd_kd": 1.0,
+    "windows_agent_interval": 10,
+    "windows_paging_veto_pages_per_sec": 1000,
+    "balloon_major_fault_veto_per_sec": 50,
     "manual_increase_grace_seconds": 600
   },
   "vms": [
@@ -253,6 +330,20 @@ The following finite numeric settings can also be overridden per VM:
 | `pd_kp` | `0.5` | Greater than 0, at most 1 | Proportional gain |
 | `pd_kd` | `1.0` | 0 to 10 seconds | Derivative gain; 0 disables derivative braking |
 
+These integer settings can be set in `default` and overridden per VM:
+
+| Setting | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `windows_agent_interval` | `10` | At least 1 second | Minimum interval between Windows agent launch/status checks |
+| `windows_paging_veto_pages_per_sec` | `1000` | At least 0 | Windows Pages/sec threshold above which reclaim is blocked |
+| `balloon_major_fault_veto_per_sec` | `50` | At least 0 | Balloon major-fault rate threshold above which reclaim is blocked |
+
+`windows_sample_max_age` is derived, not a configuration option:
+`max(30, windows_agent_interval * 3)` seconds. For example, an interval of
+15 seconds accepts samples up to 45 seconds old. Threshold comparisons are
+strictly greater than; a zero paging threshold blocks reclaim for any positive
+rate, rather than disabling the protection.
+
 These finite numeric settings apply to the whole host and are accepted only in
 the optional `general` section:
 
@@ -262,6 +353,12 @@ the optional `general` section:
 | `host_min_free_ratio` | `0.2` | Greater than 0, at most 1 | Host available-memory safety buffer as a fraction of total RAM |
 
 When `general` or an option is omitted, the documented built-in defaults apply.
+
+`general.agent_workers` controls the persistent Guest Agent thread pool size.
+It must be an integer from 1 to 16 and defaults to 4; it cannot be set in
+`default` or overridden per VM. Four workers are the recommended starting point;
+larger pools may help hosts with many guests. The pool is created once at daemon
+startup, so changing this setting requires restarting the service.
 
 `manual_increase_grace_seconds` postpones reductions after the daemon detects
 that a VM's current memory increased without a request from the daemon. Set it
@@ -381,13 +478,11 @@ aggressiveness cannot recover memory that guests genuinely need.
 ### 3. Balance reclaim speed and responsiveness
 
 - **Stats period (VM XML)**: use 1 to 2 seconds for rapidly changing workloads,
-  or up to 5 seconds for steadier ones. Polling automatically follows the
-  smallest monitored period, but each guest still supplies fresh samples at
-  its own period. Faster polling cannot compensate for a slow guest stats
-  period. For example, use `<stats period='1'/>` for `db-prod-01` and
-  `<stats period='5'/>` for a steady secondary guest. This reduces the
-  secondary guest's stats refresh frequency, not the daemon's query frequency:
-  with a 1-second minimum it still polls all monitored guests every second.
+  or up to 5 seconds for steadier ones. The timer follows the greatest common
+  divisor of monitored periods, while each guest is queried only after its own
+  period has elapsed. For example, with periods of 1 and 5 seconds, the timer
+  runs every second but the secondary guest is polled no more often than every
+  5 seconds. Faster polling cannot compensate for a slow guest stats period.
 - **`reclaim_ratio`** is a per-second base rate. Start at `0.015`; reduce it
   to `0.005` if reclaim causes guest I/O spikes or latency. Increase gradually
   only if the host remains pressured while guests have sustained surplus.
@@ -511,13 +606,17 @@ guest does not block future adjustments indefinitely. The daemon may retry on
 the next usable sample, subject to the normal pressure and grace-period rules.
 Expiration is checked even when guest statistics are stale.
 
-The static floor protects the reserve. A separate floor protects the guest's
-anonymous pages and active file cache during reclaim only:
+The static floor protects the reserve. A separate reclaim-only floor protects
+the guest's anonymous pages and active file cache when both metrics are
+available. Otherwise, it uses `max(0, actual - usable)` if `actual > 0` and
+`usable >= 0`, regardless of statistics source (guest agent or balloon):
 
 ```
 Denominator = max(0.1, 1 - keep_free_ratio)
 ReserveFloor = int(2 * keep_free_kb / Denominator)
-GuestFloor = ceil((AnonPages + Active(file) + keep_free_kb) / Denominator)
+ProtectedMemory = AnonPages + Active(file)             # when both are available
+ProtectedMemory = max(0, actual - usable)              # otherwise, with usable stats
+GuestFloor = ceil((ProtectedMemory + keep_free_kb) / Denominator)
 StaticFloor = min(maximum_ram, max(minimum_ram, ReserveFloor))
 ReclaimFloor = min(maximum_ram, max(StaticFloor, GuestFloor))
 ```
@@ -530,9 +629,20 @@ If the guest floor reaches or exceeds current RAM, reclaim is skipped; active
 file cache cannot trigger growth. The proportional reserve still uses
 current RAM, not the VM's historical or maximum RAM. A VM whose maximum is too
 small cannot maintain the configured reserve. `Inactive(file)` is not part of
-the floor. If either guest floor metric is missing, the reserve floor still
-applies. Balloon pages and virtio-mem blocks are rounded so that a guest-backed
-floor is not crossed, subject to the VM's maximum.
+the Linux metric-based floor. The fallback depends on what the source counts
+as usable memory; it cannot precisely distinguish active memory from
+recoverable cache. Windows agent samples count free/zero pages and Normal/Reserve
+standby as usable, without adding protected cache again to the floor.
+If neither the guest metrics nor usable actual/usable statistics are available,
+only the static floor applies.
+
+With a constant working set, the fallback can stop reclaim above the
+instantaneous reserve: it protects `(working set + keep_free_kb) / Denominator`,
+not just working set plus reserve. For example, a 768 MiB working set, a
+512 MiB minimum reserve and `keep_free_ratio = 0.1` produce a balloon reclaim
+floor of 1,456,356 KiB after page alignment.
+Balloon pages and virtio-mem blocks are rounded so that a guest-backed floor
+is not crossed, subject to the VM's maximum.
 
 - **Balloon:** Round the capped target down to a multiple of 4 KiB. Skip the
   adjustment if the rounded target differs from current RAM by less than 1 MiB.
